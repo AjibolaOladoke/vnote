@@ -1,0 +1,594 @@
+/*
+    Markdown events:
+        - markdownTextUpdated(p_text)
+        - basicMarkdownRendered()
+        - fullMarkdownRendered()
+*/
+class MarkdownViewerCore extends VXCore {
+    constructor() {
+        super();
+
+        // name -> worker.
+        this.workers = new Map();
+
+        this.numOfOngoingWorkers = 0;
+
+        this.pendingData = {
+            text: null,
+            lineNumber: -1,
+            anchor: null
+        }
+
+        this.numOfMuteScroll = 0;
+
+        this.navigationSnapshot = 0;
+        this.navigationTargets = [];
+        this.navigationLinkDestinations = new WeakMap();
+
+        this.turndown = null;
+
+        // Dict mapping from {id, index} to callback for renderGraph().
+        this.renderGraphCallbacks = {}
+    }
+
+    initOnLoad() {
+        // Init DOM nodes.
+        this.bodyContainer = document.getElementById('body-container');
+        this.contentContainer = document.getElementById('vx-content');
+        this.inplacePreviewContainer = document.getElementById('vx-inplace-preview');
+
+        const bodyStyle = window.getComputedStyle(document.body);
+        this.originalBodyBackgroundColor = bodyStyle.backgroundColor;
+        this.originalBodyPadding = bodyStyle.padding;
+
+        this.nodeLineMapper = new NodeLineMapper(this, this.contentContainer);
+        this.setHeadingFoldingEnabled(window.vxOptions.headingFoldingEnabled);
+
+        this.graphPreviewer = new GraphPreviewer(this, this.inplacePreviewContainer);
+
+        this.crossCopyer = new CrossCopy(this);
+
+        this.searcher = new MarkJs(this, this.contentContainer);
+
+        this.setContentContainerOption('vx-constrain-image-width',
+                                       window.vxOptions.constrainImageWidthEnabled || !window.vxOptions.scrollable);
+        this.setContentContainerOption('vx-image-align-center',
+                                       window.vxOptions.imageAlignCenterEnabled);
+        this.setContentContainerOption('vx-indent-first-line',
+                                       window.vxOptions.indentFirstLineEnabled);
+        this.setContentContainerOption('line-numbers',
+                                       window.vxOptions.codeBlockLineNumberEnabled);
+        this.setContentContainerOption('vx-code-wrap',
+                                       window.vxOptions.codeBlockLineWrapEnabled);
+        this.setBodyOption('vx-transparent-background',
+                           window.vxOptions.transparentBackgroundEnabled);
+        this.setContentContainerOption('vx-nonscrollable',
+                                       !window.vxOptions.scrollable);
+
+        this.setBodySize(window.vxOptions.bodyWidth, window.vxOptions.bodyHeight);
+        document.body.style.height = '800';
+    }
+
+    setContentContainerOption(p_class, p_enabled) {
+        if (p_enabled) {
+            this.contentContainer.classList.add(p_class);
+        } else {
+            this.contentContainer.classList.remove(p_class);
+        }
+    }
+
+    setBodyOption(p_class, p_enabled) {
+        if (p_enabled) {
+            document.body.classList.add(p_class);
+        } else {
+            document.body.classList.remove(p_class);
+        }
+    }
+
+    setHeadingFoldingEnabled(p_enabled) {
+        window.vxOptions.headingFoldingEnabled = p_enabled;
+        this.nodeLineMapper.setHeadingFoldingEnabled(p_enabled);
+    }
+
+    registerWorker(p_worker) {
+        this.workers.set(p_worker.name, p_worker);
+
+        p_worker.register(this);
+    }
+
+    finishWorker(p_name) {
+        --this.numOfOngoingWorkers;
+        if (this.numOfOngoingWorkers == 0) {
+            // Signal out anyway.
+            this.emit('fullMarkdownRendered');
+            window.vxMarkdownAdapter.setWorkFinished();
+
+            // Check pending work.
+            if (this.pendingData.text) {
+                this.setMarkdownText(this.pendingData.text);
+            } else if (this.pendingData.lineNumber > -1) {
+                this.scrollToLine(this.pendingData.lineNumber);
+            }
+        }
+    }
+
+    getWorker(p_name) {
+        return this.workers.get(p_name);
+    }
+
+    // Flatten whatever the export target cannot render, then tell the C++ side the page is ready.
+    //
+    // p_options: { rasterizeMath: bool, rasterizeDiagrams: bool }.
+    //
+    // Every worker MAY implement `prepareForExport(p_options)` and return a Promise (or nothing
+    // when it has no work to do). This is the ONLY export entry point the C++ side knows about:
+    // it must not name individual workers, so a new renderer can join simply by implementing the
+    // hook. onPdfRenderReady() is signalled exactly once, after every hook has settled - a
+    // rejected hook is logged and treated as done, so one broken renderer cannot hang the export.
+    prepareForExport(p_options) {
+        if (window.vxPresentation) {
+            window.vxPresentation.setActive(false);
+        }
+        let options = p_options || {};
+        let tasks = [];
+        this.workers.forEach(function (p_worker) {
+            if (!p_worker || typeof p_worker.prepareForExport !== 'function') {
+                return;
+            }
+
+            try {
+                let task = p_worker.prepareForExport(options);
+                if (task) {
+                    tasks.push(Promise.resolve(task).catch(function (p_err) {
+                        console.error('prepareForExport failed', p_worker.name, p_err);
+                    }));
+                }
+            } catch (p_err) {
+                console.error('prepareForExport threw', p_worker.name, p_err);
+            }
+        });
+
+        Promise.all(tasks).then(function () {
+            window.vxMarkdownAdapter.onPdfRenderReady();
+        });
+    }
+
+    kickOffMarkdown() {
+        if (this.kickedOff) {
+            return;
+        }
+
+        console.log('viewer is ready now, kick off Markdown');
+        this.kickedOff = true;
+
+        window.vxMarkdownAdapter.setReady(true);
+    }
+
+    setMarkdownText(p_text) {
+        if (window.vxPresentation) {
+            window.vxPresentation.setActive(false);
+        }
+        ++this.navigationSnapshot;
+        this.navigationTargets = [];
+        if (this.numOfOngoingWorkers > 0) {
+            this.pendingData.text = p_text;
+            console.info('wait for last render finish with remaing workers',
+                         this.numOfOngoingWorkers);
+        } else {
+            this.numOfOngoingWorkers = this.workers.size;
+            this.pendingData.text = null;
+            console.log('start new round with ' + this.numOfOngoingWorkers + ' workers');
+            this.emit('markdownTextUpdated', p_text);
+        }
+    }
+
+    // CSS client coordinates, shared by snapshot collection and activation revalidation.
+    visibleNavigationRect(p_element) {
+        if (!this.contentContainer || !p_element || !p_element.isConnected
+            || !this.contentContainer.contains(p_element)) {
+            return null;
+        }
+        const viewport = Utils.viewPortRect();
+        let left = 0;
+        let top = 0;
+        let right = viewport.width;
+        let bottom = viewport.height;
+        for (let node = p_element; node; node = node.parentElement) {
+            const style = window.getComputedStyle(node);
+            if (style.display === 'none' || style.visibility !== 'visible'
+                || style.contentVisibility === 'hidden' || Number(style.opacity) === 0) {
+                return null;
+            }
+            // Chromium can retain client rects for closed details contents.
+            if (node.tagName === 'DETAILS' && !node.open) {
+                const summary = node.querySelector(':scope > summary');
+                if (!summary || !summary.contains(p_element)) {
+                    return null;
+                }
+            }
+            if (node === p_element) {
+                continue;
+            }
+            const clipsX = /^(hidden|clip|scroll|auto)$/.test(style.overflowX);
+            const clipsY = /^(hidden|clip|scroll|auto)$/.test(style.overflowY);
+            if (clipsX || clipsY) {
+                const rect = node.getBoundingClientRect();
+                if (clipsX) {
+                    left = Math.max(left, rect.left + node.clientLeft);
+                    right = Math.min(right, rect.left + node.clientLeft + node.clientWidth);
+                }
+                if (clipsY) {
+                    top = Math.max(top, rect.top + node.clientTop);
+                    bottom = Math.min(bottom, rect.top + node.clientTop + node.clientHeight);
+                }
+            }
+        }
+        for (const fragment of p_element.getClientRects()) {
+            const x = Math.max(left, fragment.left);
+            const y = Math.max(top, fragment.top);
+            const width = Math.min(right, fragment.right) - x;
+            const height = Math.min(bottom, fragment.bottom) - y;
+            if ([x, y, width, height].every(Number.isFinite) && width > 0 && height > 0) {
+                return { x, y, width, height };
+            }
+        }
+        return null;
+    }
+
+    getNavigationTargets() {
+        ++this.navigationSnapshot;
+        this.navigationTargets = [];
+        const result = { snapshot: this.navigationSnapshot, targets: [] };
+        if (!this.initialized || !this.contentContainer || this.numOfOngoingWorkers > 0
+            || this.pendingData.text !== null) {
+            return result;
+        }
+        for (const element of this.contentContainer.querySelectorAll('a[href]')) {
+            const domHref = element.getAttribute('href');
+            const href = window.vxOptions.protectedView
+                ? this.navigationLinkDestinations.get(element) : domHref;
+            if (!href || !href.trim() || href === '#') {
+                continue;
+            }
+            let url;
+            try { url = new URL(href, document.baseURI).href; } catch (_) { continue; }
+            const rect = this.visibleNavigationRect(element);
+            if (!rect) {
+                continue;
+            }
+            const index = this.navigationTargets.length;
+            this.navigationTargets.push({ element, domHref, href, url, rect });
+            result.targets.push({ index, x: rect.x, y: rect.y,
+                                  width: rect.width, height: rect.height });
+        }
+        // Snapshot indices keep DOM identity even when hints are assigned in visual order.
+        result.targets.sort((a, b) => a.y - b.y || a.x - b.x || a.index - b.index);
+        return result;
+    }
+
+    resolveNavigationTarget(p_snapshot, p_index) {
+        if (p_snapshot !== this.navigationSnapshot || !Number.isInteger(p_index) || p_index < 0
+            || !this.initialized || this.numOfOngoingWorkers > 0 || this.pendingData.text !== null) {
+            return null;
+        }
+        const target = this.navigationTargets[p_index];
+        if (!target || target.element.getAttribute('href') !== target.domHref) {
+            return null;
+        }
+        const href = window.vxOptions.protectedView
+            ? this.navigationLinkDestinations.get(target.element) : target.domHref;
+        if (href !== target.href) {
+            return null;
+        }
+        try {
+            if (new URL(href, document.baseURI).href !== target.url) {
+                return null;
+            }
+        } catch (_) { return null; }
+        const rect = this.visibleNavigationRect(target.element);
+        if (!rect || rect.x !== target.rect.x || rect.y !== target.rect.y
+            || rect.width !== target.rect.width || rect.height !== target.rect.height) {
+            return null;
+        }
+        return { href: target.href, url: target.url };
+    }
+
+    scrollToLine(p_lineNumber) {
+        if (p_lineNumber < 0) {
+            return;
+        }
+        if (this.numOfOngoingWorkers > 0) {
+            this.pendingData.lineNumber = p_lineNumber;
+            console.log('wait for render finish before scroll');
+        } else {
+            this.pendingData.lineNumber = -1;
+            this.nodeLineMapper.scrollToLine(p_lineNumber);
+        }
+    }
+
+    scrollToAnchor(p_anchor) {
+        if (window.vxPresentation && window.vxPresentation.scrollToAnchor(p_anchor)) {
+            return;
+        }
+        if (!p_anchor) {
+            return;
+        }
+        if (this.numOfOngoingWorkers > 0) {
+            this.pendingData.anchor = p_anchor;
+            console.log('wait for render finish before scroll');
+        } else {
+            this.pendingData.anchor = '';
+            this.nodeLineMapper.scrollToAnchor(p_anchor);
+        }
+    }
+
+    setBasicMarkdownRendered() {
+        this.emit('basicMarkdownRendered');
+    }
+
+    muteScroll() {
+        ++this.numOfMuteScroll;
+    }
+
+    unmuteScroll() {
+        window.setTimeout(() => {
+            if (this.numOfMuteScroll > 0) {
+                --this.numOfMuteScroll;
+                if (this.numOfMuteScroll == 0) {
+                    this.nodeLineMapper.updateAfterScrollUnmuted();
+                }
+            }
+        }, 1000);
+    }
+
+    isScrollMuted() {
+        return this.numOfMuteScroll > 0;
+    }
+
+    setTopLineNumber(p_lineNumber) {
+        window.vxMarkdownAdapter.setTopLineNumber(p_lineNumber);
+    }
+
+    previewGraph(p_id, p_timeStamp, p_lang, p_text, p_scale = 1) {
+        if (this.graphPreviewer) {
+            this.graphPreviewer.previewGraph(p_id, p_timeStamp, p_lang, p_text, p_scale);
+        }
+    }
+
+    previewMath(p_id, p_timeStamp, p_text, p_scale = 1) {
+        if (this.graphPreviewer) {
+            this.graphPreviewer.previewMath(p_id, p_timeStamp, p_text, p_scale);
+        }
+    }
+
+    setGraphPreviewData(p_data) {
+        window.vxMarkdownAdapter.setGraphPreviewData(p_data.id,
+                                                     p_data.timeStamp,
+                                                     p_data.format,
+                                                     p_data.data,
+                                                     p_data.base64,
+                                                     p_data.needScale,
+                                                     p_data.logicalWidth || 0,
+                                                     p_data.logicalHeight || 0);
+    }
+
+    setMathPreviewData(p_data) {
+        window.vxMarkdownAdapter.setMathPreviewData(p_data.id,
+                                                    p_data.timeStamp,
+                                                    p_data.format,
+                                                    p_data.data,
+                                                    p_data.base64,
+                                                    p_data.needScale,
+                                                    p_data.logicalWidth || 0,
+                                                    p_data.logicalHeight || 0);
+    }
+
+    setHeadings(p_headings, p_hasSectionNumber) {
+        window.vxMarkdownAdapter.setHeadings(p_headings, p_hasSectionNumber);
+    }
+
+    setCurrentHeadingAnchor(p_idx, p_anchor) {
+        window.vxMarkdownAdapter.setCurrentHeadingAnchor(p_idx, p_anchor);
+    }
+
+    scroll(p_up) {
+        EasyAccess.scroll(p_up);
+    }
+
+    setKeyPress(p_key, p_ctrl, p_shift, p_meta) {
+        window.vxMarkdownAdapter.setKeyPress(p_key, p_ctrl, p_shift, p_meta);
+    }
+
+    zoom(p_zoomIn) {
+        window.vxMarkdownAdapter.zoom(p_zoomIn);
+    }
+
+    htmlToMarkdown(p_id, p_timeStamp, p_html) {
+        if (!this.turndown) {
+            this.turndown = new TurndownConverter(this);
+        }
+
+        let markdown = this.turndown.turndown(p_html);
+        window.vxMarkdownAdapter.setMarkdownFromHtml(p_id, p_timeStamp, markdown);
+    }
+
+    highlightCodeBlock(p_idx, p_timeStamp, p_text) {
+        let match = /^```[^\S\n]*(\S+)?\s*\n([\s\S]+)\n```\s*$/.exec(p_text);
+        if (!match || !match[1] || !match[2]) {
+            window.vxMarkdownAdapter.setCodeBlockHighlightHtml(p_idx, p_timeStamp, '');
+            return;
+        }
+
+        let lang = match[1];
+        let body = match[2];
+
+        if (Prism && Prism.languages[lang]) {
+             let html = Prism.highlight(body, Prism.languages[lang], lang);
+            window.vxMarkdownAdapter.setCodeBlockHighlightHtml(p_idx, p_timeStamp, html);
+        } else {
+            window.vxMarkdownAdapter.setCodeBlockHighlightHtml(p_idx, p_timeStamp, '');
+        }
+    }
+
+    highlightMath(p_idx, p_timeStamp, p_text) {
+        // Highlight the display math source line by line, so that no Prism token
+        // span ever crosses a newline. Prism's LaTeX grammar wraps whole
+        // dollar-delimited formulas and \begin{...}\end{...} environments in a
+        // single (multi-line) token; if we highlighted the whole block at once,
+        // such a span would be split into malformed fragments by the per-line
+        // HTML matcher on the C++ side. Highlighting each line on its own keeps
+        // every returned fragment self-contained at the cost of cross-line
+        // grammar context, which is acceptable for source-level highlighting.
+        if (!(Prism && Prism.languages.latex)) {
+            window.vxMarkdownAdapter.setMathHighlightHtml(p_idx, p_timeStamp, '');
+            return;
+        }
+
+        let htmlLines = p_text.split('\n').map(function(line) {
+            return Prism.highlight(line, Prism.languages.latex, 'latex');
+        });
+        window.vxMarkdownAdapter.setMathHighlightHtml(p_idx, p_timeStamp, htmlLines.join('\n'));
+    }
+
+    parseStyleSheet(p_id, p_styleSheet) {
+        let doc = document.implementation.createHTMLDocument('');
+        let styleEle = document.createElement('style');
+        styleEle.textContent = p_styleSheet;
+        doc.body.appendChild(styleEle);
+
+        let styles = [];
+        for (let i = 0; i < styleEle.sheet.cssRules.length; ++i) {
+            let rule = styleEle.sheet.cssRules[i];
+            if (rule.type != CSSRule.STYLE_RULE) {
+                continue;
+            }
+
+            styles.push({
+                selector: rule.selectorText,
+                color: rule.style.color,
+                backgroundColor: rule.style.backgroundColor,
+                fontWeight: rule.style.fontWeight,
+                fontStyle: rule.style.fontStyle
+            });
+        }
+
+        window.vxMarkdownAdapter.setStyleSheetStyles(p_id, styles);
+    }
+
+    // Resolve the anchor id of the heading at 0-based source line @p_lineNumber
+    // of @p_text via the MarkdownIt worker, which owns the live markdown-it
+    // instance.
+    getHeadingAnchor(p_id, p_text, p_lineNumber) {
+        let worker = this.getWorker('markdownit');
+        let result = worker ? worker.getHeadingAnchor(p_text, p_lineNumber)
+                            : { found: false, anchor: '' };
+        window.vxMarkdownAdapter.setHeadingAnchor(p_id, result.found, result.anchor);
+    }
+
+    setCrossCopyTargets(p_targets) {
+        window.vxMarkdownAdapter.setCrossCopyTargets(p_targets);
+    }
+
+    crossCopy(p_id, p_timeStamp, p_target, p_baseUrl, p_html) {
+        this.crossCopyer.crossCopy(p_id, p_timeStamp, p_target, p_baseUrl, p_html);
+    }
+
+    setCrossCopyResult(p_id, p_timeStamp, p_html) {
+        window.vxMarkdownAdapter.setCrossCopyResult(p_id, p_timeStamp, p_html);
+    }
+
+    findText(p_texts, p_options, p_currentMatchLine) {
+        this.searcher.findText(p_texts, p_options, p_currentMatchLine);
+    }
+
+    showFindResult(p_texts, p_totalMatches, p_currentMatchIndex) {
+        window.vxMarkdownAdapter.setFindText(p_texts, p_totalMatches, p_currentMatchIndex);
+    }
+
+    saveContent() {
+        if (window.vxPresentation) {
+            window.vxPresentation.setActive(false);
+        }
+        if (!this.initialized) {
+            console.warn('saveContent() called before initialization');
+            window.vxMarkdownAdapter.setSavedContent('', '', '');
+            return;
+        }
+        // fetchStyleContent() serializes even media="not all" stylesheets. Keep presentation
+        // assets out of reader exports, then synchronously put their links back in place.
+        const styles = Array.from(document.querySelectorAll('[data-vx-presentation-style]'))
+            .map(link => [link, document.createComment('vx-presentation-style')]);
+        for (const [link, placeholder] of styles) {
+            link.replaceWith(placeholder);
+        }
+        try {
+            window.vxMarkdownAdapter.setSavedContent("",
+                                                     Utils.fetchStyleContent(),
+                                                     this.contentContainer.outerHTML,
+                                                     document.body.classList.value);
+        } finally {
+            for (const [link, placeholder] of styles) {
+                placeholder.replaceWith(link);
+            }
+        }
+    }
+
+    setBodySize(p_width, p_height) {
+        if (p_width > 0) {
+            document.body.style.width = p_width + 'px';
+        }
+
+        if (p_height > 0) {
+            document.body.style.height = p_height + 'px';
+        }
+    }
+
+    setContentMaxWidth(p_maxWidth) {
+        if (p_maxWidth > 0) {
+            this.bodyContainer.style.maxWidth = p_maxWidth + 'px';
+            this.bodyContainer.style.marginLeft = 'auto';
+            this.bodyContainer.style.marginRight = 'auto';
+            this.bodyContainer.style.backgroundColor = this.originalBodyBackgroundColor;
+            this.bodyContainer.style.padding = this.originalBodyPadding;
+
+            this.contentContainer.style.maxWidth = 'none';
+            this.contentContainer.style.marginLeft = '';
+            this.contentContainer.style.marginRight = '';
+
+            document.body.style.padding = '0';
+
+            document.body.style.backgroundColor = '';
+        } else {
+            document.body.style.backgroundColor = '';
+            document.body.style.padding = '';
+
+            this.bodyContainer.style.backgroundColor = '';
+            this.bodyContainer.style.padding = '';
+            this.bodyContainer.style.maxWidth = '';
+            this.bodyContainer.style.marginLeft = '';
+            this.bodyContainer.style.marginRight = '';
+
+            this.contentContainer.style.maxWidth = '';
+            this.contentContainer.style.marginLeft = '';
+            this.contentContainer.style.marginRight = '';
+        }
+    }
+
+    renderGraph(p_id, p_index, p_format, p_lang, p_text, p_callback, p_imageIndex = 0) {
+        this.renderGraphCallbacks[p_id + '_' + p_index] = p_callback;
+        window.vxMarkdownAdapter.renderGraph(p_id, p_index, p_format, p_lang, p_text, p_imageIndex);
+    }
+
+    graphRenderDataReady(p_id, p_index, p_format, p_data, p_success) {
+        let key = p_id + '_' + p_index;
+        let found = key in this.renderGraphCallbacks;
+        console.log('markdownviewercore graphRenderDataReady: key=', key, 'format=', p_format,
+                    'dataLen=', p_data ? p_data.length : 0, 'callbackFound=', found);
+        if (found) {
+            this.renderGraphCallbacks[key](p_id, p_index, p_format, p_data, p_success);
+            delete this.renderGraphCallbacks[key];
+        }
+    }
+}
+
+window.vxcore = new MarkdownViewerCore();

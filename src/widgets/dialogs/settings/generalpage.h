@@ -1,0 +1,48 @@
+#ifndef GENERALPAGE_H
+#define GENERALPAGE_H
+
+#include "settingspage.h"
+
+class QComboBox;
+class QCheckBox;
+class QLineEdit;
+
+namespace vnotex {
+class GeneralPage : public SettingsPage {
+  Q_OBJECT
+public:
+  explicit GeneralPage(ServiceLocator &p_services, QWidget *p_parent = nullptr);
+
+  QString title() const Q_DECL_OVERRIDE;
+
+  QString slug() const Q_DECL_OVERRIDE;
+
+protected:
+  void loadInternal() Q_DECL_OVERRIDE;
+
+  bool saveInternal() Q_DECL_OVERRIDE;
+
+private:
+  void setupUI();
+
+  QComboBox *m_localeComboBox = nullptr;
+
+  QLineEdit *m_appNameLineEdit = nullptr;
+
+  QComboBox *m_openGLComboBox = nullptr;
+
+  QCheckBox *m_allowCtrlAltShortcutsCheckBox = nullptr;
+
+  QCheckBox *m_systemTrayCheckBox = nullptr;
+
+  QCheckBox *m_startOnStartupCheckBox = nullptr;
+
+  QCheckBox *m_recoverLastSessionCheckBox = nullptr;
+
+  QCheckBox *m_checkForUpdatesCheckBox = nullptr;
+
+  QComboBox *m_updateSourceComboBox = nullptr;
+};
+} // namespace vnotex
+
+#endif // GENERALPAGE_H

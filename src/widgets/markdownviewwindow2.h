@@ -1,0 +1,325 @@
+#ifndef MARKDOWNVIEWWINDOW2_H
+#define MARKDOWNVIEWWINDOW2_H
+
+#include "viewwindow2.h"
+
+#include <QColor>
+#include <QScopedPointer>
+#include <QSet>
+#include <QSharedPointer>
+#include <QVector>
+
+#include <controllers/legacyimagemigrationcontroller.h>
+#include <core/markdowneditorconfig.h>
+
+#include "outlineprovider.h"
+
+class QSplitter;
+class QTimer;
+class QPrinter;
+class QAction;
+class QMenu;
+
+namespace vnotex {
+class MarkdownEditor;
+class MarkdownViewer;
+class WebViewer;
+class MarkdownViewerAdapter;
+class OutlineProvider;
+class PreviewHelper;
+class MarkdownEditorController;
+class MarkdownViewWindowController;
+class ImageHostController;
+class EditorStatusBarBinder;
+class LegacyImageMigrationBar;
+class PresentationToolBarEffect;
+
+// Concrete ViewWindow2 subclass for Markdown files.
+// Supports dual-mode (Edit/Read) with lazy-initialized editor and viewer,
+// mode switching with position sync, debounced editor-to-viewer preview,
+// and a full formatting toolbar.
+//
+// Uses ServiceLocator + Buffer2 (new architecture).
+class MarkdownViewWindow2 : public ViewWindow2 {
+  Q_OBJECT
+public:
+  friend class TextViewWindowHelper;
+
+  explicit MarkdownViewWindow2(ServiceLocator &p_services, const Buffer2 &p_buffer,
+                               QWidget *p_parent = nullptr,
+                               ViewWindowMode p_initialMode = ViewWindowMode::Read);
+
+  ~MarkdownViewWindow2();
+
+  QString getLatestContent() const Q_DECL_OVERRIDE;
+
+  bool isEncodingSupported() const Q_DECL_OVERRIDE { return true; }
+
+  void setMode(ViewWindowMode p_mode) Q_DECL_OVERRIDE;
+
+  void fetchNavigationTargets(NavigationTargetsCallback p_callback) override;
+
+  int getCursorPosition() const Q_DECL_OVERRIDE;
+
+  int getScrollPosition() const Q_DECL_OVERRIDE;
+
+  ViewPositionState capturePositionState() const override;
+
+  void restorePositionState(const ViewPositionState &p_state) override;
+
+  QSharedPointer<OutlineProvider> getOutlineProvider() const Q_DECL_OVERRIDE;
+
+public slots:
+  void handleEditorConfigChange() Q_DECL_OVERRIDE;
+
+  void applySnippet(const QString &p_name) Q_DECL_OVERRIDE;
+
+  void applySnippet() Q_DECL_OVERRIDE;
+
+  void clearHighlights() Q_DECL_OVERRIDE;
+
+  void applyFileOpenSettings(const FileOpenSettings &p_settings) override;
+
+protected slots:
+  void setModified(bool p_modified) Q_DECL_OVERRIDE;
+
+  void handleFindTextChanged(const QString &p_text, FindOptions p_options) Q_DECL_OVERRIDE;
+
+  void handleFindNext(const QStringList &p_texts, FindOptions p_options) Q_DECL_OVERRIDE;
+
+  void handleReplace(const QString &p_text, FindOptions p_options,
+                     const QString &p_replaceText) Q_DECL_OVERRIDE;
+
+  void handleReplaceAll(const QString &p_text, FindOptions p_options,
+                        const QString &p_replaceText) Q_DECL_OVERRIDE;
+
+  void handleFindAndReplaceWidgetClosed() Q_DECL_OVERRIDE;
+
+  void handleFindAndReplaceWidgetOpened() Q_DECL_OVERRIDE;
+
+protected:
+  QStringList getAttachmentScanExcludedPaths() const override;
+
+  void handleThemeChanged() override;
+
+  void addAdditionalRightToolBarActions(QToolBar *p_toolBar) Q_DECL_OVERRIDE;
+
+  void addAdditionalViewToolBarActions(QToolBar *p_toolBar) override;
+
+  void paintEvent(QPaintEvent *p_event) override;
+
+  void addAdditionalMenuActions(QMenu *p_menu) Q_DECL_OVERRIDE;
+
+  void syncEditorFromBuffer() Q_DECL_OVERRIDE;
+
+  void handlePrint() Q_DECL_OVERRIDE;
+
+  bool aboutToClose(bool p_force) Q_DECL_OVERRIDE;
+
+  bool eventFilter(QObject *p_obj, QEvent *p_event) Q_DECL_OVERRIDE;
+
+  void scrollUp() Q_DECL_OVERRIDE;
+
+  void scrollDown() Q_DECL_OVERRIDE;
+
+  void zoom(bool p_zoomIn) Q_DECL_OVERRIDE;
+
+  void resetZoom() Q_DECL_OVERRIDE;
+
+  QString selectedText() const Q_DECL_OVERRIDE;
+
+  QPoint getFloatingWidgetPosition() Q_DECL_OVERRIDE;
+
+  void applyReadableWidth() Q_DECL_OVERRIDE;
+
+private:
+  void setupUI();
+
+  void setupToolBar();
+
+  void setupTextEditor();
+
+  bool setupViewer();
+
+  void setPresentationMode(bool p_on);
+
+  void requestPresentationWhenReady();
+
+  void handlePresentationStateChanged(bool p_active, const QString &p_error);
+
+  void updatePresentationUi();
+
+  void setDebugVisible(bool p_visible);
+
+  void releaseProtectedView();
+
+  void updateSectionNumberOptions();
+  void updateEditSectionNumberOptions(bool p_activate);
+  void removeSessionHeadingSectionNumbers();
+
+  void setupPreviewHelper();
+
+  void setupOutlineProvider();
+
+  void connectEditorSignals();
+
+  template <class T> QSharedPointer<Outline> headingsToOutline(const QVector<T> &p_headings);
+
+  void focusEditor();
+
+  void setModeInternal(ViewWindowMode p_mode, bool p_syncBuffer);
+
+  void syncTextEditorFromBuffer(bool p_syncPositionFromReadMode);
+
+  void syncViewerFromBuffer(bool p_syncPositionFromEditMode);
+
+  void syncEditorContentsToPreview();
+
+  void syncEditorPositionToPreview();
+
+  void updateEditorFromConfig();
+
+  void updatePreviewHelperFromConfig(const MarkdownEditorConfig &p_mdConfig);
+
+  void updateWebViewerConfig();
+
+  void setEditViewMode(MarkdownEditorConfig::EditViewMode p_mode);
+
+  void handleTypeAction(int p_action) Q_DECL_OVERRIDE;
+
+  void fetchWordCountInfo(const std::function<void(const WordCountInfo &)> &p_callback) const
+      Q_DECL_OVERRIDE;
+
+  MarkdownViewerAdapter *adapter() const;
+
+  void handleExternalCodeBlockHighlightRequest(int p_idx, quint64 p_timeStamp,
+                                               const QString &p_text);
+
+  void handleExternalMathHighlightRequest(int p_idx, quint64 p_timeStamp, const QString &p_text);
+
+  // Fetch the Prism .token styles from the theme's highlight style sheet once and
+  // push them to the editor. Shared by the code block and math highlight paths.
+  void ensureExternalHighlightStyles();
+
+  void onPrintFinished(bool p_succeeded);
+
+  int getEditLineNumber() const;
+
+  int getReadLineNumber() const;
+
+  bool isReadMode() const;
+
+  void snapshotInitialImages();
+
+  void clearObsoleteImages();
+
+  // Whether @p_url points at an image host rather than a notebook asset.
+  static bool isRemoteImageUrl(const QString &p_url);
+
+  // Settings -> Image Host -> "Clear obsolete images".
+  bool isClearObsoleteImageAtImageHostEnabled() const;
+
+  // Legacy (vx_images / _v_images) image migration. Runs at most once per
+  // window; the originals are removed once, at close, by the finalize gate.
+  void scheduleLegacyImageCheck();
+
+  void runLegacyImageCheck();
+
+  void applyLegacyImageMigration();
+
+  bool isLastWindowForBuffer() const;
+
+  void handleOpenFileRequest(const QString &p_filePath);
+  void handleAnchorJump(const QString &p_anchor);
+
+  void handleImageHostChanged(const QString &p_providerName);
+  void updateImageHostMenu();
+
+  // Apply a task list checkbox toggle requested from the preview.
+  // @p_lineNumber: 0-based source line of the task list item.
+  void onTaskListItemToggleRequested(int p_lineNumber, bool p_checked);
+
+  // Controllers (owned via QObject parent).
+  MarkdownEditorController *m_editorController = nullptr;
+  MarkdownViewWindowController *m_windowController = nullptr;
+  ImageHostController *m_imageHostController = nullptr;
+
+  // Widgets (managed by QObject/layout).
+  QSplitter *m_mainSplitter = nullptr;
+  QSplitter *m_splitter = nullptr;
+  MarkdownEditor *m_editor = nullptr; // Lazily created.
+  MarkdownViewer *m_viewer = nullptr; // Lazily created.
+  WebViewer *m_debugViewer = nullptr; // Lazily created.
+  QAction *m_debugAction = nullptr;
+  QAction *m_presentationAction = nullptr;
+  PresentationToolBarEffect *m_presentationEffect = nullptr;
+  QColor m_presentationBackground;
+  struct ProtectedView;
+  QScopedPointer<ProtectedView> m_protectedView;
+  PreviewHelper *m_previewHelper = nullptr;
+  QMenu *m_imageHostMenu = nullptr;
+
+  // Column-based status bar glue (built eagerly in setupUI, attached to the
+  // editor once it exists). Managed by QObject (this).
+  EditorStatusBarBinder *m_statusBinder = nullptr;
+
+  // State.
+  bool m_propagateEditorToBuffer = false;
+  bool m_editSectionNumberEnabled = false;
+  QString m_editSectionNumberPattern = QStringLiteral("1.1.");
+  bool m_editDetectHeading1ForSectionNumber = true;
+  bool m_switchingMode = false; // Reentrancy guard.
+  bool m_removingHeadingSectionNumbers = false;
+  quint64 m_navigationGeneration = 0;
+  int m_textEditorBufferRevision = 0;
+  int m_viewerBufferRevision = 0;
+  ViewWindowMode m_previousMode = ViewWindowMode::Invalid;
+  bool m_viewerReady = false;
+  // Intent, dispatch and web confirmation are distinct while the page/deck initializes.
+  bool m_presentationRequested = false;
+  bool m_presentationRequestSent = false;
+  bool m_presentationActive = false;
+  bool m_preparingPresentation = false;
+  quint64 m_presentationGeneration = 0;
+  QString m_viewerMathRenderer;
+  QString m_viewerMathJaxScript;
+  QString m_viewerPlantUmlFormat;
+  bool m_refreshMathPreviewsOnReady = false;
+  QString m_pendingAnchor;
+  MarkdownEditorConfig::EditViewMode m_editViewMode = MarkdownEditorConfig::EditViewMode::EditOnly;
+
+  // Runtime on/off for in-place preview (toolbar toggle). Not persisted; mirrors
+  // the editor default (VMarkdownEditor::m_inplacePreviewEnabled = true).
+  bool m_inplacePreviewEnabled = true;
+
+  QTimer *m_syncPreviewTimer = nullptr;
+  QSharedPointer<QPrinter> m_printer;
+
+  // Outline provider: bridges heading changes from editor/viewer to OutlinePopup.
+  QSharedPointer<OutlineProvider> m_outlineProvider;
+
+  // Whether external code-block highlight styles have been fetched from the theme.
+  // Reset on theme change so styles are re-initialized from the new theme.
+  bool m_codeBlockStylesInitialized = false;
+
+  // Image tracking for obsolete-image cleanup. Both sets hold the EXACT
+  // markdown destination string, which may be a note-relative local path or a
+  // remote image-host URL (http/https). Cleanup compares these spellings, so
+  // remote entries are additionally matched by ImageHostPath::remoteUrlIdentity()
+  // before anything is deleted at the host.
+  QSet<QString> m_initialImages;  // Present when the buffer was opened.
+  QSet<QString> m_insertedImages; // Inserted during this session.
+
+  // Legacy image migration state. The check runs at most once per window; the
+  // rewrites are consumed by the close-time finalize.
+  bool m_legacyImageCheckDone = false;
+  // Managed by QObject/layout.
+  LegacyImageMigrationBar *m_legacyImageBar = nullptr;
+  // Lazily created, this-parented.
+  LegacyImageMigrationController *m_legacyImageController = nullptr;
+  QVector<LegacyImageRewrite> m_pendingLegacyMigration;
+};
+
+} // namespace vnotex
+
+#endif // MARKDOWNVIEWWINDOW2_H

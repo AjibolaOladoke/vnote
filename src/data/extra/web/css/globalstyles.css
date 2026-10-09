@@ -1,0 +1,130 @@
+/* Styles here will be placed in the header of the HTML template as global embedded styles. */
+#vx-content.vx-constrain-image-width img,
+#vx-content.vx-constrain-image-width div.vx-plantuml-graph > svg,
+#vx-content.vx-constrain-image-width div.vx-mermaid-graph,
+#vx-content.vx-constrain-image-width div.vx-flowchartjs-graph,
+#vx-content.vx-constrain-image-width div.vx-wavedrom-graph {
+    max-width: 100% !important;
+    height: auto !important;
+}
+
+figure {
+    margin: auto;
+}
+
+figcaption {
+    font-style: italic;
+}
+
+#vx-content.vx-image-align-center figure {
+    text-align: center;
+}
+
+#vx-content.vx-image-align-center figcaption {
+    text-align: center;
+}
+
+#vx-content.vx-image-align-center div.vx-plantuml-graph,
+#vx-content.vx-image-align-center div.vx-mermaid-graph,
+#vx-content.vx-image-align-center div.vx-flowchartjs-graph,
+#vx-content.vx-image-align-center div.vx-wavedrom-graph {
+    margin-left: auto;
+    margin-right: auto;
+}
+
+/* Table of Contents */
+.vx-table-of-contents ol {
+    list-style: none;
+}
+
+.vx-header-anchor {
+    visibility: hidden;
+    vertical-align: middle;
+}
+
+.vx-header-anchor::after {
+    content: attr(vx-data-anchor-icon);
+}
+
+#vx-content h1:hover .vx-header-anchor, #vx-content h2:hover .vx-header-anchor, #vx-content h3:hover .vx-header-anchor, #vx-content h4:hover .vx-header-anchor, #vx-content h5:hover .vx-header-anchor, #vx-content h6:hover .vx-header-anchor {
+    visibility: visible;
+    vertical-align: middle;
+}
+
+/* Reserve width to prevent hover wrapping; font-relative height keeps short headings compact. */
+.vx-heading-fold-toggle {
+    align-items: center;
+    background: transparent;
+    border: 0;
+    color: currentColor;
+    cursor: pointer;
+    display: inline-flex;
+    font: inherit;
+    height: 1em;
+    justify-content: center;
+    line-height: 1;
+    margin-left: 0.25rem;
+    padding: 0;
+    vertical-align: middle;
+    visibility: hidden;
+    width: 2.5rem;
+}
+
+/* Generated decoration keeps the chevron out of copied HTML content. */
+.vx-heading-fold-toggle::after {
+    border-bottom: 0.125rem solid currentColor;
+    border-right: 0.125rem solid currentColor;
+    box-sizing: content-box;
+    content: '';
+    height: 0.5rem;
+    transform: rotate(45deg);
+    width: 0.5rem;
+}
+
+.vx-heading-fold-toggle[aria-expanded="false"]::after {
+    transform: rotate(-45deg);
+}
+
+.vx-heading-fold > h1:hover > .vx-heading-fold-toggle,
+.vx-heading-fold > h2:hover > .vx-heading-fold-toggle,
+.vx-heading-fold > h3:hover > .vx-heading-fold-toggle,
+.vx-heading-fold > h4:hover > .vx-heading-fold-toggle,
+.vx-heading-fold > h5:hover > .vx-heading-fold-toggle,
+.vx-heading-fold > h6:hover > .vx-heading-fold-toggle {
+    visibility: visible;
+}
+
+
+#vx-content.vx-indent-first-line p {
+    text-indent: 2em;
+}
+
+body.vx-transparent-background {
+    background-color: transparent !important;
+}
+
+#vx-content.vx-nonscrollable pre {
+    white-space: pre-wrap !important;
+    word-break: break-all !important;
+    overflow: hidden !important;
+}
+
+#vx-content.vx-nonscrollable pre code {
+    white-space: pre-wrap !important;
+    word-break: break-all !important;
+}
+
+#vx-content.vx-nonscrollable code,
+#vx-content.vx-nonscrollable a {
+    word-break: break-all !important;
+}
+
+#vx-content.vx-code-wrap pre {
+    white-space: pre-wrap !important;
+    word-break: break-all !important;
+}
+
+#vx-content.vx-code-wrap pre code {
+    white-space: pre-wrap !important;
+    word-break: break-all !important;
+}

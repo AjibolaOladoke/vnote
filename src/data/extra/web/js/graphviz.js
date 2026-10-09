@@ -1,0 +1,244 @@
+class Graphviz extends GraphRenderer {
+    constructor() {
+        super();
+
+        this.name = 'graphviz';
+
+        this.graphDivClass = 'vx-graphviz-graph';
+
+        this.extraScripts = [this.scriptFolderPath + '/viz.js/viz.js',
+                             this.scriptFolderPath + '/viz.js/full.render.js'];
+
+        this.viz = null;
+        this.pendingRender = Promise.resolve();
+
+        this.format = 'svg';
+
+        this.langs = ['dot', 'graphviz', 'neato', 'twopi', 'circo', 'fdp', 'sfdp',
+                      'patchwork', 'osage'];
+
+        this.useWeb = true;
+
+        this.nextLocalGraphIndex = 1;
+    }
+
+    registerInternal() {
+        this.vxcore.on('basicMarkdownRendered', () => {
+            this.reset();
+            this.renderCodeNodes(window.vxOptions.transformSvgToPngEnabled ? 'png' : 'svg');
+        });
+
+        this.vxcore.getWorker('markdownit').addLangsToSkipHighlight(this.langs);
+        this.useWeb = window.vxOptions.protectedView || window.vxOptions.webGraphviz;
+        if (!this.useWeb) {
+            this.extraScripts = [];
+        }
+
+        // The web path runs viz.js (asm.js) in-page and is CPU-bound, like Mermaid.
+        // The local path is a process round trip per diagram and must stay
+        // unbounded, or a document full of diagrams gets dramatically slower.
+        // See GraphRenderer.concurrencyLimit.
+        this.concurrencyLimit = this.useWeb ? 4 : 0;
+    }
+
+    initializeRenderer() {
+        if (this.useWeb) {
+            this.viz = new Viz();
+        }
+    }
+
+    // viz.js corrupts its underlying renderer instance once a render throws, so any
+    // later render reads garbage from the poisoned heap (bogus "syntax error"
+    // messages). Discard the poisoned instance and build a fresh one.
+    recreateViz() {
+        if (this.useWeb) {
+            try {
+                this.viz = new Viz();
+            } catch (err) {
+                console.error('failed to recreate Viz instance', err);
+                this.viz = null;
+            }
+        }
+    }
+
+    // Serialize access to Viz's shared heap. Its promise rejects after the
+    // synchronous render returns, so another caller must wait for recovery.
+    renderWithViz(p_text, p_engine, p_format) {
+        const result = this.pendingRender.then(() => {
+            return p_format === 'svg'
+                ? this.viz.renderSVGElement(p_text, {engine: p_engine})
+                : this.viz.renderImageElement(p_text, {engine: p_engine});
+        });
+        this.pendingRender = result.catch(() => this.recreateViz());
+        return result;
+    }
+
+    getEngineForLanguage(p_lang) {
+        if (p_lang === 'graphviz') {
+            return 'dot';
+        }
+        return this.langs.includes(p_lang) ? p_lang : null;
+    }
+
+    getEngineForNode(p_node) {
+        for (const name of p_node.classList) {
+            if (name.startsWith('lang-')) {
+                return this.getEngineForLanguage(name.substring(5));
+            }
+        }
+        return 'dot';
+    }
+
+    // Interface 1.
+    render(p_node, p_classList, p_format) {
+        this.format = p_format;
+
+        super.render(p_node, p_classList);
+    }
+
+    // Interface 2.
+    renderCodeNodes(p_format) {
+        this.format = p_format;
+
+        super.renderCodeNodes();
+    }
+
+    renderOne(p_node, p_idx) {
+        if (this.useWeb) {
+            this.renderOnline(p_node, p_idx);
+        } else {
+            this.renderLocal(p_node);
+        }
+    }
+
+    renderOnline(p_node, p_idx) {
+        const engine = this.getEngineForNode(p_node);
+        if (engine === null || engine === 'sfdp') {
+            if (engine === 'sfdp') {
+                this.reportProblem('Graphviz engine sfdp requires local Graphviz');
+            }
+            this.finishRenderingOne();
+            return true;
+        }
+        console.assert(this.viz);
+        let func = function(p_graphviz, p_renderNode) {
+            let graphviz = p_graphviz;
+            let node = p_renderNode;
+            return function(p_element) {
+                if (window.vxOptions.protectedView) {
+                    MarkdownIt.sanitizeProtectedSvg(p_element);
+                }
+                if (node) {
+                    let wrapperDiv = document.createElement('div');
+                    wrapperDiv.classList.add(graphviz.graphDivClass);
+                    wrapperDiv.appendChild(p_element);
+
+                    Utils.checkSourceLine(p_node, wrapperDiv);
+
+                    Utils.replaceNodeWithPreCheck(p_node, wrapperDiv);
+
+                    if (graphviz.format === 'svg') {
+                        window.vxImageViewer.setupSVGToView(p_element, false);
+                    } else {
+                        window.vxImageViewer.setupIMGToView(p_element);
+                    }
+                }
+                graphviz.finishRenderingOne();
+            };
+        };
+
+        this.renderWithViz(p_node.textContent, engine, this.format)
+            .then(func(this, p_node))
+            .catch((p_err) => {
+                console.error('failed to render Graphviz', p_err);
+                this.finishRenderingOne();
+            });
+
+        return true;
+    }
+
+    renderLocal(p_node) {
+        const engine = this.getEngineForNode(p_node);
+        if (engine === null) {
+            this.finishRenderingOne();
+            return;
+        }
+        let func = function(p_graphviz, p_renderNode) {
+            let graphviz = p_graphviz;
+            let node = p_renderNode;
+            return function(format, data) {
+                if (node && data.length > 0) {
+                    let obj = null;
+                    if (format == 'svg') {
+                        obj = document.createElement('div');
+                        obj.classList.add(graphviz.graphDivClass);
+                        obj.innerHTML = data;
+                        window.vxImageViewer.setupSVGToView(obj.children[0], false);
+                    } else {
+                        obj = document.createElement('div');
+                        obj.classList.add(graphviz.graphDivClass);
+
+                        let imgObj = document.createElement('img');
+                        obj.appendChild(imgObj);
+                        imgObj.src = "data:image/" + format + ";base64, " + data;
+                        window.vxImageViewer.setupIMGToView(imgObj);
+                    }
+
+                    Utils.checkSourceLine(p_node, obj);
+
+                    Utils.replaceNodeWithPreCheck(p_node, obj);
+                }
+                graphviz.finishRenderingOne();
+            };
+        };
+
+        let callback = func(this, p_node);
+        this.vxcore.renderGraph(this.id,
+            this.nextLocalGraphIndex++,
+            this.format,
+            engine,
+            p_node.textContent,
+            function(id, index, format, data) {
+                callback(format, data);
+            });
+    }
+
+    // Render a graph from @p_text in SVG format.
+    // p_callback(svgNode).
+    renderText(p_text, p_engine, p_callback) {
+        console.assert(this.useWeb, "renderText() should be called only when web Graphviz is enabled");
+
+        if (p_engine === 'sfdp') {
+            this.reportProblem('Graphviz engine sfdp requires local Graphviz');
+            p_callback(null);
+            return;
+        }
+
+        let func = () => {
+            if (!this.viz) {
+                console.log("viz is not ready yet");
+                p_callback(null);
+                return;
+            }
+            this.renderWithViz(p_text, p_engine, 'svg')
+                .then((node) => {
+                    if (window.vxOptions.protectedView) {
+                        MarkdownIt.sanitizeProtectedSvg(node);
+                    }
+                    p_callback(node);
+                })
+                .catch((err) => {
+                    console.error('failed to render Graphviz', err);
+                    p_callback(null);
+                });
+        };
+
+        if (!this.initialize(func, () => p_callback(null))) {
+            return;
+        }
+
+        func();
+    }
+}
+
+window.vxcore.registerWorker(new Graphviz());

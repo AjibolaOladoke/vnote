@@ -1,0 +1,275 @@
+#ifndef SESSIONCONFIG_H
+#define SESSIONCONFIG_H
+
+#include "iconfig.h"
+
+#include <QString>
+#include <QVector>
+
+#include <export/exportdata.h>
+#include <search/searchdata.h>
+
+namespace vnotex {
+class IConfigMgr;
+
+enum class QuickAccessOpenMode { Default, Read, Edit };
+
+class SessionConfig : public IConfig {
+public:
+  struct MainWindowStateGeometry {
+    bool operator==(const MainWindowStateGeometry &p_other) const {
+      return m_mainState == p_other.m_mainState && m_mainGeometry == p_other.m_mainGeometry &&
+             m_visibleDocksBeforeExpand == p_other.m_visibleDocksBeforeExpand;
+    }
+
+    QByteArray m_mainState;
+
+    QByteArray m_mainGeometry;
+
+    QStringList m_visibleDocksBeforeExpand;
+  };
+
+  struct QuickNoteScheme {
+    bool operator==(const QuickNoteScheme &p_other) const;
+
+    void fromJson(const QJsonObject &p_jobj);
+
+    QJsonObject toJson() const;
+
+    QString m_name;
+
+    // Where to create the quick note.
+    QString m_folderPath;
+
+    // Name of the quick note. Snippet is supported.
+    QString m_noteName;
+
+    QString m_template;
+
+    bool m_detachedView = false;
+  };
+
+  struct QuickAccessItem {
+    bool operator==(const QuickAccessItem &p_other) const;
+
+    void fromJson(const QJsonObject &p_jobj);
+
+    QJsonObject toJson() const;
+
+    QString m_path;
+
+    QuickAccessOpenMode m_openMode = QuickAccessOpenMode::Default;
+
+    QString m_uuid;
+  };
+
+  enum OpenGL { None, Desktop, Angle, Software };
+
+  struct ExternalProgram {
+    void fromJson(const QJsonObject &p_jobj);
+
+    QJsonObject toJson() const;
+
+    QStringList fetchCommandArgs(const QString &p_file) const;
+
+    QString m_name;
+
+    // %1: the file paths to open.
+    QString m_command;
+
+    QString m_shortcut;
+
+    // File suffixes this program handles (without leading dots, lowercase).
+    QStringList m_suffixes;
+
+    // Returns true if this program handles files with the given suffix (case-insensitive).
+    bool matchesSuffix(const QString &p_suffix) const;
+
+    bool operator==(const ExternalProgram &p_other) const {
+      return m_name == p_other.m_name && m_command == p_other.m_command &&
+             m_shortcut == p_other.m_shortcut && m_suffixes == p_other.m_suffixes;
+    }
+
+    bool operator!=(const ExternalProgram &p_other) const { return !(*this == p_other); }
+
+    static const QString c_systemProgramName;
+    bool isSystemProgram() const;
+  };
+
+  explicit SessionConfig(IConfigMgr *p_mgr);
+
+  ~SessionConfig();
+
+  void fromJson(const QJsonObject &p_jobj) Q_DECL_OVERRIDE;
+
+  const QString &getNewNotebookDefaultRootFolderPath() const;
+  void setNewNotebookDefaultRootFolderPath(const QString &p_path);
+
+  const QString &getExternalMediaDefaultPath() const;
+  void setExternalMediaDefaultPath(const QString &p_path);
+
+  void update() Q_DECL_OVERRIDE;
+
+  QJsonObject toJson() const Q_DECL_OVERRIDE;
+
+  SessionConfig::MainWindowStateGeometry getMainWindowStateGeometry() const;
+  void setMainWindowStateGeometry(const SessionConfig::MainWindowStateGeometry &p_state);
+
+  OpenGL getOpenGL() const;
+  void setOpenGL(OpenGL p_option);
+
+  bool getSystemTitleBarEnabled() const;
+  void setSystemTitleBarEnabled(bool p_enabled);
+
+  static QString openGLToString(OpenGL p_option);
+  static OpenGL stringToOpenGL(const QString &p_str);
+
+  static QString openModeToString(QuickAccessOpenMode p_mode);
+  static QuickAccessOpenMode stringToOpenMode(const QString &p_str);
+
+  int getMinimizeToSystemTray() const;
+  void setMinimizeToSystemTray(bool p_enabled);
+
+  bool getStartOnSystemStartup() const;
+  void setStartOnSystemStartup(bool p_enabled);
+
+  const ExportOption &getExportOption() const;
+  void setExportOption(const ExportOption &p_option);
+
+  const QVector<ExportCustomOption> &getCustomExportOptions() const;
+  void setCustomExportOptions(const QVector<ExportCustomOption> &p_options);
+
+  const SearchOption &getSearchOption() const;
+  void setSearchOption(const SearchOption &p_option);
+
+  QByteArray getViewAreaSessionAndClear();
+  void setViewAreaSession(const QByteArray &p_bytes);
+
+  // Get the view area layout (new architecture, JSON-based).
+  QJsonObject getViewAreaLayout() const;
+  void setViewAreaLayout(const QJsonObject &p_layout);
+
+  QByteArray getNotebookExplorerSession() const;
+  void setNotebookExplorerSession(const QByteArray &p_bytes);
+
+  QByteArray getTagExplorerSession() const;
+  void setTagExplorerSession(const QByteArray &p_bytes);
+
+  const QVector<QuickAccessItem> &getQuickAccessItems() const;
+  void setQuickAccessItems(const QVector<QuickAccessItem> &p_items);
+
+  QStringList getQuickAccessFiles() const;
+  void setQuickAccessFiles(const QStringList &p_files);
+  void removeQuickAccessFile(const QString &p_file);
+
+  const QVector<ExternalProgram> &getExternalPrograms() const;
+  const ExternalProgram *findExternalProgram(const QString &p_name) const;
+  void setExternalPrograms(const QVector<ExternalProgram> &p_programs);
+  const ExternalProgram *findExternalProgramBySuffix(const QString &p_suffix) const;
+
+  const QVector<QuickNoteScheme> &getQuickNoteSchemes() const;
+  void setQuickNoteSchemes(const QVector<QuickNoteScheme> &p_schemes);
+
+  const QString &getCurrentNotebook() const;
+  void setCurrentNotebook(const QString &p_guid);
+
+  const QString &getLastToolTipDate() const;
+  void setLastToolTipDate(const QString &p_date);
+
+  int getNextToolTipIndex() const;
+  void setNextToolTipIndex(int p_index);
+
+  const QStringList &getSearchHistory() const;
+  void addSearchHistory(const QString &p_keyword);
+  void setSearchHistory(const QStringList &p_history);
+
+  const QStringList &getUnitedEntryHistory() const;
+  void addUnitedEntryHistory(const QString &p_entry);
+  void setUnitedEntryHistory(const QStringList &p_history);
+
+private:
+  void loadCore(const QJsonObject &p_session);
+
+  QJsonObject saveCore() const;
+
+  void loadStateAndGeometry(const QJsonObject &p_session);
+
+  QJsonObject saveStateAndGeometry() const;
+
+  void loadExternalPrograms(const QJsonObject &p_session);
+
+  QJsonArray saveExternalPrograms() const;
+
+  void loadQuickNoteSchemes(const QJsonObject &p_session);
+
+  QJsonArray saveQuickNoteSchemes() const;
+
+  void loadQuickAccessItems(const QJsonObject &p_session);
+
+  QJsonArray saveQuickAccessItems() const;
+
+  void doVersionSpecificOverride();
+
+  void loadExportOption(const QJsonObject &p_session);
+
+  QJsonObject saveExportOption() const;
+
+  QString m_newNotebookDefaultRootFolderPath;
+
+  MainWindowStateGeometry m_mainWindowStateGeometry;
+
+  OpenGL m_openGL = OpenGL::None;
+
+  // Whether use system's title bar or not.
+  bool m_systemTitleBarEnabled = false;
+
+  // Whether to minimize to tray.
+  // -1 for prompting for user;
+  // 0 for disabling minimizing to system tray;
+  // 1 for enabling minimizing to system tray.
+  int m_minimizeToSystemTray = -1;
+
+  // Whether to launch VNote on system startup (effected on Windows only).
+  bool m_startOnSystemStartup = false;
+
+  ExportOption m_exportOption;
+
+  QVector<ExportCustomOption> m_customExportOptions;
+
+  SearchOption m_searchOption;
+
+  QByteArray m_viewAreaSession;
+
+  // New architecture: JSON-based view area layout (splitter tree + workspace mapping).
+  QJsonObject m_viewAreaLayout;
+
+  QByteArray m_notebookExplorerSession;
+
+  QByteArray m_tagExplorerSession;
+
+  QVector<QuickAccessItem> m_quickAccessItems;
+
+  QVector<ExternalProgram> m_externalPrograms;
+
+  // Default folder path to open for external media like images and files.
+  QString m_externalMediaDefaultPath;
+
+  QVector<QuickNoteScheme> m_quickNoteSchemes;
+
+  // GUID of the currently active notebook.
+  QString m_currentNotebook;
+
+  // Local daily-tip progress. Permanent opt-out lives in CoreConfig.
+  QString m_lastToolTipDate;
+
+  int m_nextToolTipIndex = 0;
+
+  // Keyword search history (most recent first, capped at 20).
+  QStringList m_searchHistory;
+
+  // United entry command history (most recent first, capped at 20).
+  QStringList m_unitedEntryHistory;
+};
+} // namespace vnotex
+
+#endif // SESSIONCONFIG_H

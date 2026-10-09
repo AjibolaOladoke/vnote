@@ -1,0 +1,99 @@
+#include "statuswidget.h"
+
+#include <QDebug>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QStackedLayout>
+#include <QTimer>
+
+using namespace vnotex;
+
+StatusWidget::StatusWidget(QWidget *p_parent) : QWidget(p_parent) {
+  m_outerLayout = new QHBoxLayout(this);
+  m_outerLayout->setContentsMargins(0, 0, 0, 0);
+  m_outerLayout->setSpacing(0);
+
+  m_stackHost = new QWidget(this);
+  m_mainLayout = new QStackedLayout(m_stackHost);
+  m_mainLayout->setContentsMargins(0, 0, 0, 0);
+  m_mainLayout->setSpacing(0);
+  m_outerLayout->addWidget(m_stackHost, 1);
+
+  m_messageLabel = new QLabel(m_stackHost);
+  m_messageLabel->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+  m_mainLayout->addWidget(m_messageLabel);
+
+  m_messageTimer = new QTimer(this);
+  m_messageTimer->setSingleShot(true);
+  connect(m_messageTimer, &QTimer::timeout, this, &StatusWidget::clearMessage);
+}
+
+StatusWidget::~StatusWidget() {
+  if (m_editorWidget) {
+    m_editorWidget->setParent(nullptr);
+  }
+}
+
+void StatusWidget::setVisible(bool p_visible) {
+  QWidget::setVisible(p_visible && (m_editorWidget || m_outerLayout->count() > 1 ||
+                                    !m_messageLabel->text().isEmpty()));
+}
+
+void StatusWidget::updateVisibility() {
+  // A shared widget may receive content before it is attached to its host.
+  if (parentWidget() || isVisible()) {
+    setVisible(true);
+  }
+}
+
+void StatusWidget::showMessage(const QString &p_msg, int p_milliseconds) {
+  if (p_msg.isEmpty()) {
+    clearMessage();
+    return;
+  }
+
+  m_messageLabel->setText(p_msg);
+  m_mainLayout->setCurrentWidget(m_messageLabel);
+
+  if (p_milliseconds > 0) {
+    m_messageTimer->start(p_milliseconds);
+  }
+  updateVisibility();
+}
+
+void StatusWidget::setEditorStatusWidget(const QSharedPointer<QWidget> &p_editorWidget) {
+  Q_ASSERT(!m_editorWidget);
+  m_editorWidget = p_editorWidget;
+  m_editorWidget->setParent(m_stackHost);
+  m_mainLayout->addWidget(m_editorWidget.data());
+  m_mainLayout->setCurrentWidget(m_editorWidget.data());
+  updateVisibility();
+}
+
+void StatusWidget::addCornerWidget(QWidget *p_widget) {
+  if (!p_widget) {
+    return;
+  }
+  p_widget->setParent(this);
+  m_outerLayout->addWidget(p_widget, 0);
+  p_widget->show();
+  updateVisibility();
+}
+
+void StatusWidget::resizeEvent(QResizeEvent *p_event) {
+  QWidget::resizeEvent(p_event);
+
+  int maxWidth = width() - 10;
+  if (maxWidth <= 0) {
+    maxWidth = width();
+  }
+  m_messageLabel->setMaximumWidth(maxWidth);
+}
+
+void StatusWidget::clearMessage() {
+  m_messageLabel->clear();
+  if (m_editorWidget) {
+    m_mainLayout->setCurrentWidget(m_editorWidget.data());
+  }
+  updateVisibility();
+}

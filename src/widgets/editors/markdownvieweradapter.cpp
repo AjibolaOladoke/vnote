@@ -1,0 +1,560 @@
+#include "markdownvieweradapter.h"
+
+#include <QDateTime>
+#include <QElapsedTimer>
+#include <QMap>
+#include <QTimer>
+#include <QUrl>
+
+#include "../outlineprovider.h"
+#include "graphvizhelper.h"
+#include "plantumlhelper.h"
+#include <core/logging.h>
+#include <core/servicelocator.h>
+#include <gui/utils/guiutils.h>
+#include <gui/utils/imageutils.h>
+#include <utils/sectionnumberutils.h>
+
+using namespace vnotex;
+
+MarkdownViewerAdapter::Position::Position(int p_lineNumber, const QString &p_anchor)
+    : m_lineNumber(p_lineNumber), m_anchor(p_anchor) {}
+
+QJsonObject MarkdownViewerAdapter::Position::toJson() const {
+  QJsonObject obj;
+  obj["lineNumber"] = m_lineNumber;
+  obj["anchor"] = m_anchor;
+  return obj;
+}
+
+MarkdownViewerAdapter::PreviewData::PreviewData(quint64 p_id, TimeStamp p_timeStamp,
+                                                const QString &p_format, const QByteArray &p_data,
+                                                bool p_needScale, const QSize &p_logicalSize)
+    : m_id(p_id), m_timeStamp(p_timeStamp), m_format(p_format), m_data(p_data),
+      m_needScale(p_needScale), m_logicalSize(p_logicalSize) {}
+
+MarkdownViewerAdapter::Heading::Heading(const QString &p_name, int p_level, const QString &p_anchor)
+    : m_name(p_name), m_level(p_level), m_anchor(p_anchor) {}
+
+MarkdownViewerAdapter::Heading MarkdownViewerAdapter::Heading::fromJson(const QJsonObject &p_obj) {
+  return Heading(p_obj.value(QStringLiteral("name")).toString(),
+                 p_obj.value(QStringLiteral("level")).toInt(),
+                 p_obj.value(QStringLiteral("anchor")).toString());
+}
+
+MarkdownViewerAdapter::CssRuleStyle
+MarkdownViewerAdapter::CssRuleStyle::fromJson(const QJsonObject &p_obj) {
+  CssRuleStyle style;
+  style.m_selector = p_obj[QStringLiteral("selector")].toString();
+  style.m_color = p_obj[QStringLiteral("color")].toString();
+  style.m_backgroundColor = p_obj[QStringLiteral("backgroundColor")].toString();
+  style.m_fontWeight = p_obj[QStringLiteral("fontWeight")].toString();
+  style.m_fontStyle = p_obj[QStringLiteral("fontStyle")].toString();
+  return style;
+}
+
+QTextCharFormat MarkdownViewerAdapter::CssRuleStyle::toTextCharFormat() const {
+  QTextCharFormat fmt;
+  if (!m_color.isEmpty()) {
+    fmt.setForeground(GuiUtils::toColor(m_color));
+  }
+  if (!m_backgroundColor.isEmpty()) {
+    fmt.setBackground(QColor(m_color));
+  }
+  if (m_fontWeight.contains(QStringLiteral("bold"))) {
+    fmt.setFontWeight(QFont::Bold);
+  }
+  if (m_fontStyle.contains(QStringLiteral("italic"))) {
+    fmt.setFontItalic(true);
+  }
+  return fmt;
+}
+
+MarkdownViewerAdapter::MarkdownViewerAdapter(QObject *p_parent) : WebViewAdapter(p_parent) {}
+
+MarkdownViewerAdapter::MarkdownViewerAdapter(ServiceLocator &p_services, QObject *p_parent)
+    : WebViewAdapter(p_parent), m_services(&p_services) {}
+
+MarkdownViewerAdapter::~MarkdownViewerAdapter() {}
+
+void MarkdownViewerAdapter::setProtectedView(bool p_protected) { m_protectedView = p_protected; }
+
+QString MarkdownViewerAdapter::protectedImageUrl(const QString &p_url) {
+  if (!m_protectedView || p_url.size() > 32 * 1024 * 1024 ||
+      !p_url.startsWith(QLatin1String("data:image/"), Qt::CaseInsensitive)) {
+    return QString();
+  }
+  const int comma = p_url.indexOf(QLatin1Char(','));
+  if (comma < 0) {
+    return QString();
+  }
+  const auto header = p_url.left(comma);
+  const auto encoded = p_url.mid(comma + 1).toLatin1();
+  auto input = header.endsWith(QLatin1String(";base64"), Qt::CaseInsensitive)
+                   ? QByteArray::fromBase64(encoded, QByteArray::AbortOnBase64DecodingErrors)
+                   : QByteArray::fromPercentEncoding(encoded);
+  QByteArray data;
+  QByteArray mime;
+  const bool valid = ImageUtils::protectedImageData(input, data, mime);
+  input.fill(0);
+  if (!valid) {
+    return QString();
+  }
+  const auto result = QStringLiteral("data:%1;base64,%2")
+                          .arg(QString::fromLatin1(mime), QString::fromLatin1(data.toBase64()));
+  data.fill(0);
+  return result;
+}
+
+void MarkdownViewerAdapter::activateProtectedLink(const QString &p_url) {
+  if (m_protectedView && QUrl(p_url).isRelative() && !p_url.startsWith(QLatin1Char('/')) &&
+      !p_url.startsWith(QLatin1Char('\\'))) {
+    emit protectedLinkRequested(p_url);
+  }
+}
+
+void MarkdownViewerAdapter::setText(int p_revision, const QString &p_text, int p_lineNumber) {
+  if (p_revision == m_revision && p_revision != 0) {
+    // Only sync line number position.
+    scrollToPosition(Position(p_lineNumber, ""));
+    return;
+  }
+
+  if (isReady()) {
+    // Diagnostics: this is where the read-mode render pass actually starts. A
+    // queued setText does not start it - the pending action only runs when the
+    // viewer signals ready - so the caller's timestamp is not the pass start.
+    qCDebug(lcPerfPreview) << "adapter setText dispatched revision=" << p_revision
+                           << "chars=" << p_text.size()
+                           << "atMs=" << QDateTime::currentMSecsSinceEpoch();
+    m_revision = p_revision;
+    emit textUpdated(p_text);
+    scrollToPosition(Position(p_lineNumber, ""));
+  } else {
+    qCDebug(lcPerfPreview) << "adapter setText queued revision=" << p_revision
+                           << "chars=" << p_text.size()
+                           << "atMs=" << QDateTime::currentMSecsSinceEpoch();
+    pendAction(std::bind(QOverload<int, const QString &, int>::of(&MarkdownViewerAdapter::setText),
+                         this, p_revision, p_text, p_lineNumber));
+  }
+}
+
+void MarkdownViewerAdapter::setText(const QString &p_text, int p_lineNumber) {
+  setText(0, p_text, p_lineNumber);
+}
+
+void MarkdownViewerAdapter::scrollToLine(int p_lineNumber) {
+  if (p_lineNumber == -1) {
+    return;
+  }
+
+  if (isReady()) {
+    m_topLineNumber = p_lineNumber;
+    emit editLineNumberUpdated(p_lineNumber);
+  } else {
+    pendAction(std::bind(&MarkdownViewerAdapter::scrollToLine, this, p_lineNumber));
+  }
+}
+
+void MarkdownViewerAdapter::setTopLineNumber(int p_lineNumber) {
+  if (m_topLineNumber == p_lineNumber) {
+    return;
+  }
+
+  m_topLineNumber = p_lineNumber;
+}
+
+void MarkdownViewerAdapter::scrollToPosition(const Position &p_pos) {
+  if (p_pos.m_lineNumber >= 0) {
+    scrollToLine(p_pos.m_lineNumber);
+  } else {
+    // Anchor.
+    scrollToAnchor(p_pos.m_anchor);
+  }
+}
+
+int MarkdownViewerAdapter::getTopLineNumber() const { return m_topLineNumber; }
+
+void MarkdownViewerAdapter::setGraphPreviewData(quint64 p_id, quint64 p_timeStamp,
+                                                const QString &p_format, const QString &p_data,
+                                                bool p_base64, bool p_needScale, int p_logicalWidth,
+                                                int p_logicalHeight) {
+  // Diagnostics: the UTF-8 + base64 decode is the first C++-side cost of a
+  // preview result and is otherwise invisible between "JS finished" and
+  // "PreviewHelper has a pixmap". Accumulated per generation and reported once
+  // on an idle timer; a per-result log line would itself distort the bridge
+  // path being measured. Gated, so it costs nothing when the category is muted.
+  const bool perf = lcPerfPreview().isDebugEnabled();
+  QElapsedTimer timer;
+  if (perf) {
+    timer.start();
+  }
+
+  auto ba = p_data.toUtf8();
+  if (p_base64 && !ba.isEmpty()) {
+    ba = QByteArray::fromBase64(ba);
+  }
+
+  if (perf) {
+    perfNoteDecode(p_timeStamp, timer.nsecsElapsed(), p_data.size(), ba.size());
+  }
+
+  const auto logicalSize =
+      p_logicalWidth > 0 && p_logicalHeight > 0 ? QSize(p_logicalWidth, p_logicalHeight) : QSize();
+  if (m_protectedView) {
+    QByteArray image;
+    QByteArray mime;
+    const bool valid = ImageUtils::protectedImageData(ba, image, mime);
+    ba.fill(0);
+    const auto format = QString::fromLatin1(mime.mid(mime.indexOf('/') + 1));
+    emit graphPreviewDataReady(PreviewData(p_id, p_timeStamp, format, valid ? image : QByteArray(),
+                                           p_needScale, logicalSize));
+    image.fill(0);
+    return;
+  }
+  emit graphPreviewDataReady(
+      PreviewData(p_id, p_timeStamp, p_format, ba, p_needScale, logicalSize));
+}
+
+void MarkdownViewerAdapter::perfNoteDecode(quint64 p_timeStamp, qint64 p_nsecs, int p_chars,
+                                           int p_bytes) {
+  // Keyed by generation rather than kept as one mutable record: results from an
+  // older generation can interleave with a newer one over the bridge, and a
+  // single record would flip back and forth and fragment both summaries.
+  auto &stats = m_perfDecodeStats[p_timeStamp];
+  ++stats.m_count;
+  stats.m_nsecs += p_nsecs;
+  stats.m_maxNsecs = qMax(stats.m_maxNsecs, p_nsecs);
+  stats.m_chars += p_chars;
+  stats.m_bytes += p_bytes;
+
+  if (!m_perfDecodeTimer) {
+    m_perfDecodeTimer = new QTimer(this);
+    m_perfDecodeTimer->setSingleShot(true);
+    m_perfDecodeTimer->setInterval(2000);
+    connect(m_perfDecodeTimer, &QTimer::timeout, this, &MarkdownViewerAdapter::perfReportDecode);
+  }
+  m_perfDecodeTimer->start();
+}
+
+void MarkdownViewerAdapter::perfReportDecode() {
+  // Reported only once the whole bridge has been idle, so each generation gets
+  // exactly one line no matter how the results interleaved.
+  for (auto it = m_perfDecodeStats.constBegin(); it != m_perfDecodeStats.constEnd(); ++it) {
+    qCDebug(lcPerfPreview) << "adapter graph decode summary ts=" << it.key()
+                           << "results=" << it.value().m_count
+                           << "totalDecodeUs=" << (it.value().m_nsecs / 1000)
+                           << "maxDecodeUs=" << (it.value().m_maxNsecs / 1000)
+                           << "chars=" << it.value().m_chars << "bytes=" << it.value().m_bytes;
+  }
+  m_perfDecodeStats.clear();
+}
+
+void MarkdownViewerAdapter::setMathPreviewData(quint64 p_id, quint64 p_timeStamp,
+                                               const QString &p_format, const QString &p_data,
+                                               bool p_base64, bool p_needScale, int p_logicalWidth,
+                                               int p_logicalHeight) {
+  auto ba = p_data.toUtf8();
+  if (p_base64 && !ba.isEmpty()) {
+    ba = QByteArray::fromBase64(ba);
+  }
+  const auto logicalSize =
+      p_logicalWidth > 0 && p_logicalHeight > 0 ? QSize(p_logicalWidth, p_logicalHeight) : QSize();
+  if (m_protectedView) {
+    QByteArray image;
+    QByteArray mime;
+    const bool valid = ImageUtils::protectedImageData(ba, image, mime);
+    ba.fill(0);
+    const auto format = QString::fromLatin1(mime.mid(mime.indexOf('/') + 1));
+    emit mathPreviewDataReady(PreviewData(p_id, p_timeStamp, format, valid ? image : QByteArray(),
+                                          p_needScale, logicalSize));
+    image.fill(0);
+    return;
+  }
+  emit mathPreviewDataReady(PreviewData(p_id, p_timeStamp, p_format, ba, p_needScale, logicalSize));
+}
+
+void MarkdownViewerAdapter::setHeadings(const QJsonArray &p_headings, bool p_hasSectionNumber) {
+  QVector<Heading> headings;
+  headings.reserve(p_headings.size());
+  for (auto const &arr : p_headings) {
+    headings.push_back(MarkdownViewerAdapter::Heading::fromJson(arr.toObject()));
+  }
+
+  OutlineProvider::makePerfectHeadings(headings, m_headings);
+  m_headingsHaveSectionNumber = !m_headings.isEmpty() && p_hasSectionNumber;
+  m_currentHeadingIndex = -1;
+
+  emit headingsChanged();
+}
+
+void MarkdownViewerAdapter::setCurrentHeadingAnchor(int p_index, const QString &p_anchor) {
+  m_currentHeadingIndex = -1;
+  if (p_index > -1) {
+    for (int i = p_index; i < m_headings.size(); ++i) {
+      if (m_headings[i].m_anchor == p_anchor) {
+        m_currentHeadingIndex = i;
+        break;
+      }
+    }
+  }
+
+  emit currentHeadingChanged();
+}
+
+const QVector<MarkdownViewerAdapter::Heading> &MarkdownViewerAdapter::getHeadings() const {
+  return m_headings;
+}
+
+int MarkdownViewerAdapter::getCurrentHeadingIndex() const { return m_currentHeadingIndex; }
+
+QJsonObject MarkdownViewerAdapter::getSectionNumberOptions() const {
+  return {{QStringLiteral("enabled"), m_autoSectionNumberEnabled},
+          {QStringLiteral("pattern"), m_sectionNumberPattern},
+          {QStringLiteral("detectHeading1ForSectionNumber"), m_detectHeading1ForSectionNumber}};
+}
+
+void MarkdownViewerAdapter::setSectionNumberOptions(bool p_enabled, const QString &p_pattern,
+                                                    bool p_detectHeading1ForSectionNumber) {
+  const auto pattern = SectionNumberUtils::normalizePattern(p_pattern);
+  if (m_autoSectionNumberEnabled == p_enabled && m_sectionNumberPattern == pattern &&
+      m_detectHeading1ForSectionNumber == p_detectHeading1ForSectionNumber) {
+    return;
+  }
+  m_autoSectionNumberEnabled = p_enabled;
+  m_sectionNumberPattern = pattern;
+  m_detectHeading1ForSectionNumber = p_detectHeading1ForSectionNumber;
+  emit sectionNumberOptionsChanged();
+}
+
+bool MarkdownViewerAdapter::getHeadingsHaveSectionNumber() const {
+  return m_headingsHaveSectionNumber;
+}
+
+void MarkdownViewerAdapter::scrollToHeading(int p_idx) {
+  if (p_idx < 0 || p_idx >= m_headings.size()) {
+    return;
+  }
+
+  if (m_headings[p_idx].m_anchor.isEmpty()) {
+    return;
+  }
+
+  scrollToPosition(Position(-1, m_headings[p_idx].m_anchor));
+}
+
+void MarkdownViewerAdapter::scrollToAnchor(const QString &p_anchor) {
+  if (p_anchor.isEmpty()) {
+    return;
+  }
+  Q_ASSERT(isReady());
+  m_currentHeadingIndex = -1;
+  emit anchorScrollRequested(p_anchor);
+}
+
+void MarkdownViewerAdapter::scroll(bool p_up) { emit scrollRequested(p_up); }
+
+void MarkdownViewerAdapter::setKeyPress(int p_key, bool p_ctrl, bool p_shift, bool p_meta) {
+  emit keyPressed(p_key, p_ctrl, p_shift, p_meta);
+}
+
+void MarkdownViewerAdapter::zoom(bool p_zoomIn) { emit zoomed(p_zoomIn); }
+
+void MarkdownViewerAdapter::setMarkdownFromHtml(quint64 p_id, quint64 p_timeStamp,
+                                                const QString &p_text) {
+  emit htmlToMarkdownReady(p_id, p_timeStamp, p_text);
+}
+
+void MarkdownViewerAdapter::setCodeBlockHighlightHtml(int p_idx, quint64 p_timeStamp,
+                                                      const QString &p_html) {
+  emit highlightCodeBlockReady(p_idx, p_timeStamp, p_html);
+}
+
+void MarkdownViewerAdapter::setMathHighlightHtml(int p_idx, quint64 p_timeStamp,
+                                                 const QString &p_html) {
+  emit highlightMathReady(p_idx, p_timeStamp, p_html);
+}
+
+void MarkdownViewerAdapter::setCrossCopyTargets(const QJsonArray &p_targets) {
+  m_crossCopyTargets.clear();
+  for (const auto &target : p_targets) {
+    m_crossCopyTargets << target.toString();
+  }
+}
+
+const QStringList &MarkdownViewerAdapter::getCrossCopyTargets() const { return m_crossCopyTargets; }
+
+QString MarkdownViewerAdapter::getCrossCopyTargetDisplayName(const QString &p_target) const {
+  static QMap<QString, QString> maps;
+  if (maps.isEmpty()) {
+    maps.insert("No Background", tr("No Background"));
+    maps.insert("Evernote", tr("Evernote"));
+    maps.insert("OneNote", tr("OneNote"));
+    maps.insert("Microsoft Word", tr("Microsoft Word"));
+    maps.insert("WeChat Public Account Editor", tr("WeChat Public Account Editor"));
+    maps.insert("Raw HTML", tr("Raw HTML"));
+  }
+
+  auto it = maps.find(p_target);
+  if (it != maps.end()) {
+    return *it;
+  }
+  qWarning() << "missing cross copy target" << p_target;
+  return p_target;
+}
+
+void MarkdownViewerAdapter::setCrossCopyResult(quint64 p_id, quint64 p_timeStamp,
+                                               const QString &p_html) {
+  emit crossCopyReady(p_id, p_timeStamp, p_html);
+}
+
+void MarkdownViewerAdapter::setWorkFinished() { emit workFinished(); }
+
+void MarkdownViewerAdapter::setPresentationMode(bool p_active, bool p_darkTheme) {
+  emit presentationModeRequested(p_active, p_darkTheme);
+}
+
+void MarkdownViewerAdapter::setPresentationState(bool p_active, const QString &p_error) {
+  emit presentationStateChanged(p_active, p_error);
+}
+
+void MarkdownViewerAdapter::saveContent() { emit contentRequested(); }
+
+void MarkdownViewerAdapter::setSavedContent(const QString &p_headContent,
+                                            const QString &p_styleContent, const QString &p_content,
+                                            const QString &p_bodyClassList) {
+  emit contentReady(p_headContent, p_styleContent, p_content, p_bodyClassList);
+}
+
+void MarkdownViewerAdapter::reset() {
+  m_revision = 0;
+  setReady(false);
+  m_topLineNumber = -1;
+  m_headings.clear();
+  m_headingsHaveSectionNumber = false;
+  m_currentHeadingIndex = -1;
+  m_crossCopyTargets.clear();
+}
+
+void MarkdownViewerAdapter::renderGraph(quint64 p_id, quint64 p_index, const QString &p_format,
+                                        const QString &p_lang, const QString &p_text,
+                                        int p_imageIndex) {
+  // Per-diagram: keep this behind a logging category. An ungated qInfo() here costs a
+  // synchronous formatted write for every diagram in a document.
+  qCDebug(lcUi) << "MarkdownViewerAdapter::renderGraph id=" << p_id << "index=" << p_index
+                << "format=" << p_format << "lang=" << p_lang << "textLen=" << p_text.size();
+  if (m_protectedView || p_text.isEmpty() || p_imageIndex < 0) {
+    emit graphRenderDataReady(p_id, p_index, p_format, QString(), false);
+    return;
+  }
+
+  // TODO(deferred): PlantUmlHelper/GraphvizHelper singletons will be replaced
+  // by services passed through PreviewHelper pipeline in a future migration.
+  // For now, both legacy and new-architecture paths use the singleton directly.
+  const auto graphvizEngine = GraphvizHelper::getEngineForLanguage(p_lang);
+  if (p_lang == QStringLiteral("puml")) {
+    PlantUmlHelper::getInst().process(
+        p_id, p_index, p_format, p_text, this,
+        [this](quint64 id, TimeStamp timeStamp, const QString &format, const QString &data,
+               bool success) { emit graphRenderDataReady(id, timeStamp, format, data, success); },
+        p_imageIndex);
+  } else if (!graphvizEngine.isEmpty()) {
+    GraphvizHelper::getInst().process(
+        p_id, p_index, p_format, p_text, this,
+        [this](quint64 id, TimeStamp timeStamp, const QString &format, const QString &data,
+               bool success) { emit graphRenderDataReady(id, timeStamp, format, data, success); },
+        0, graphvizEngine);
+  } else {
+    qWarning() << "MarkdownViewerAdapter::renderGraph unhandled lang=" << p_lang << "id=" << p_id
+               << "index=" << p_index;
+    Q_ASSERT(false);
+  }
+}
+
+void MarkdownViewerAdapter::highlightCodeBlock(int p_idx, quint64 p_timeStamp,
+                                               const QString &p_text) {
+  if (isReady()) {
+    emit highlightCodeBlockRequested(p_idx, p_timeStamp, p_text);
+  } else {
+    pendAction(
+        std::bind(&MarkdownViewerAdapter::highlightCodeBlock, this, p_idx, p_timeStamp, p_text));
+  }
+}
+
+void MarkdownViewerAdapter::highlightMath(int p_idx, quint64 p_timeStamp, const QString &p_text) {
+  if (isReady()) {
+    emit highlightMathRequested(p_idx, p_timeStamp, p_text);
+  } else {
+    pendAction(std::bind(&MarkdownViewerAdapter::highlightMath, this, p_idx, p_timeStamp, p_text));
+  }
+}
+
+void MarkdownViewerAdapter::onPdfRenderReady() { emit pdfRenderReady(); }
+
+void MarkdownViewerAdapter::setStyleSheetStyles(quint64 p_id, const QJsonArray &p_styles) {
+  QVector<CssRuleStyle> ruleStyles;
+  ruleStyles.reserve(p_styles.size());
+  for (int i = 0; i < p_styles.size(); ++i) {
+    ruleStyles.push_back(CssRuleStyle::fromJson(p_styles[i].toObject()));
+  }
+
+  invokeCallback(p_id, &ruleStyles);
+}
+
+void MarkdownViewerAdapter::fetchStylesFromStyleSheet(
+    const QString &p_styleSheet,
+    const std::function<void(const QVector<CssRuleStyle> *)> &p_callback) {
+  if (p_styleSheet.isEmpty()) {
+    p_callback(nullptr);
+    return;
+  }
+
+  if (isReady()) {
+    const quint64 id = addCallback([p_callback](void *data) {
+      p_callback(reinterpret_cast<const QVector<CssRuleStyle> *>(data));
+    });
+    emit parseStyleSheetRequested(id, p_styleSheet);
+  } else {
+    pendAction(std::bind(&MarkdownViewerAdapter::fetchStylesFromStyleSheet, this, p_styleSheet,
+                         p_callback));
+  }
+}
+
+void MarkdownViewerAdapter::setHeadingAnchor(quint64 p_id, bool p_found, const QString &p_anchor) {
+  HeadingAnchorResult result;
+  result.m_found = p_found;
+  result.m_anchor = p_anchor;
+
+  invokeCallback(p_id, &result);
+}
+
+void MarkdownViewerAdapter::fetchHeadingAnchor(
+    const QString &p_text, int p_lineNumber,
+    const std::function<void(const HeadingAnchorResult &)> &p_callback) {
+  if (p_lineNumber < 0) {
+    p_callback(HeadingAnchorResult());
+    return;
+  }
+
+  if (isReady()) {
+    const quint64 id = addCallback([p_callback](void *data) {
+      p_callback(*reinterpret_cast<const HeadingAnchorResult *>(data));
+    });
+    emit headingAnchorRequested(id, p_text, p_lineNumber);
+  } else {
+    pendAction(std::bind(&MarkdownViewerAdapter::fetchHeadingAnchor, this, p_text, p_lineNumber,
+                         p_callback));
+  }
+}
+
+void MarkdownViewerAdapter::toggleTaskListItem(int p_lineNumber, bool p_checked) {
+  if (p_lineNumber < 0) {
+    return;
+  }
+
+  emit taskListItemToggleRequested(p_lineNumber, p_checked);
+}
+
+void MarkdownViewerAdapter::emitTaskListToggleRejected(int p_lineNumber) {
+  emit taskListToggleRejected(p_lineNumber);
+}

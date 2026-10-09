@@ -1,0 +1,904 @@
+# Widgets Module
+
+Widgets are UI components that receive `ServiceLocator&` via constructor injection. This is the largest `src/` module, containing the main window, editor windows, dialogs, and the split-pane view area framework.
+
+## `2` Suffix Convention
+
+Many existing files here carry a `2` suffix (e.g., `MainWindow2`, `NotebookExplorer2`). This is a historical artifact of the now-complete migration off the legacy singleton architecture — the pre-migration counterparts have been removed, and the suffix is simply the retained name for those existing classes (renaming them would be needless churn). **New code does NOT get a suffix unless the name genuinely conflicts with an existing type.** Since the migration is finished, a brand-new widget with no `1`/legacy counterpart should use the plain name (e.g. `EncodingButton`, not `EncodingButton2`). Never introduce a `3` suffix. See [Widget Construction Pattern](#widget-construction-pattern) below for the constructor-injection pattern all widgets follow.
+
+## Toolbar Buttons With a Popup Menu
+
+Put the menu on the **QAction**, and let the toolbar create the button:
+
+```cpp
+auto *act = p_toolBar->addAction(icon, tr("More"));
+act->setMenu(menu);                                     // <- on the ACTION
+auto *btn = qobject_cast<QToolButton *>(p_toolBar->widgetForAction(act));
+btn->setPopupMode(QToolButton::InstantPopup);
+```
+
+**Do NOT build a `QToolButton` yourself and add it with `QToolBar::addWidget()`.**
+That produces a `QWidgetAction`, and when the toolbar runs out of horizontal room
+it hides the trailing items and re-offers them through its own extension (`»`)
+popup — which it builds by adding the hidden **actions** to a `QMenu`. A
+`QWidgetAction` cannot render there, so the button silently **disappears** and
+every verb behind it becomes unreachable, while the plain actions beside it keep
+working. This shipped once in `PdfViewerToolBar`: at narrow widths the whole
+overflow menu (rotate, cursor, scroll mode, spread mode, presentation, document
+properties) was simply gone.
+
+With the menu on the action both surfaces work from one declaration:
+`QToolButton::menu()` falls back to `defaultAction()->menu()` on the toolbar, and
+`QMenu` renders an action-with-a-menu as a **submenu** inside the extension
+popup. It also makes the icon reachable by
+`ViewWindowToolBarHelper2::refreshToolBarIcons()`, which recursively visits the
+toolbar actions and their action-owned menus. Precedents: `Outline` / `Tag` / `Attachment` in
+`viewwindowtoolbarhelper2.cpp`. Gate:
+`theOverflowMenuSurvivesANarrowToolBar` in `tests/widgets/test_pdfviewertoolbar.cpp`,
+which resizes a real toolbar until it overflows.
+
+`addWidget()` remains correct for something that genuinely **is** a widget — a
+spin box, a combo, a slider. Those degrade by vanishing at narrow widths, which
+is accepted; make sure a plain-action route to the same operation exists (the
+PDF page spin box is flanked by prev/next page actions for exactly this reason).
+
+Custom editor-toolbar menus derive from `ButtonPopup` and opt into
+`ButtonPopup::Alignment::Right` in their constructor. The base anchors to the
+button's global right edge and clamps horizontally to its screen's available
+geometry; Qt retains vertical placement. Never shift from the menu's existing
+position in a subclass `showEvent()` — Qt may already have moved it at a screen
+edge. Outline, Tags, Attachments, Word Count and Insert Table share this policy.
+Hidden overflow buttons keep Qt placement, as do non-editor popups using the
+`Native` default (including Notifications). Ordinary `QMenu`s remain Qt-managed.
+Gate: `tests/widgets/test_buttonpopup.cpp`.
+
+## Hiding the QToolButton Menu Indicator
+Plain-text status-bar / toolbar `QToolButton`s that open an `InstantPopup` menu
+(e.g. the status bar "Spelling" menu, the `EncodingButton`, the main toolbar
+"View" and "Settings" menus) must NOT show the built-in dropdown-arrow menu indicator. Use the
+single shared mechanism — the dynamic property:
+
+```cpp
+btn->setProperty("NoMenuIndicator", true);
+```
+
+Every bundled theme's `src/data/extra/themes/<theme>/interface.qss` styles this
+away with `QToolButton[NoMenuIndicator="true"]::menu-indicator { image: none; }`,
+so all such buttons share one look. Do NOT hand-roll a per-button inline
+stylesheet (`setStyleSheet("QToolButton::menu-indicator { image: none; }")`) —
+that bypasses theming and drifts from the shared style. When adding a new theme,
+carry the `NoMenuIndicator` rule forward. Pair the property with
+`setToolButtonStyle(Qt::ToolButtonTextOnly)` + `setAutoRaise(true)` for the flat,
+text-only status-bar look.
+
+## Widget Families
+
+### MainWindow
+
+- `MainWindow2` — new main window shell with ServiceLocator DI; owns the top-level layout, toolbar, sidebar, and view area
+
+The main toolbar ends with text-only **View** and **Settings** menus, then the
+notification button. View starts with **Expand Content Area**; Settings starts
+with the **Settings** action and a **Themes** submenu. Those primary actions
+are also registered on the main window so their shortcuts work with menus closed.
+
+Outline and Comments request a 2:1 height split on fresh layouts (missing or invalid
+saved dock state) and explicit **Reset Main Window Layout**. `MainWindow2::
+resizeDefaultRightDocks()` runs after a layout pass, only for separate, visible,
+docked panels in the right area; Qt respects their minimum sizes. A successful
+`restoreState()` keeps the user's split. Never enforce this default in
+`validateDockProportions()`, which also runs after saved-state restoration.
+
+### Notebook Explorer
+
+- `NotebookExplorer2` — sidebar explorer for notebook nodes; wires together the MVC triad (model, view, controller)
+- `NotebookSelector2` — notebook dropdown selector
+
+`NotebookExplorer2` owns both its `NotebookAfterClose` and `FileBeforeSave` hook handles
+and removes them in its destructor. `HookManager` callbacks are not QObject connections;
+widget destruction does not disconnect them automatically.
+
+Windows directory watches on expanded descendants can block a parent folder rename.
+`NotebookExplorer2` pauses its watches at `NotebookCoreService::folderRenameStarted`
+and restores them at `folderRenameFinished`, rebasing descendants only on success.
+These signals bracket the synchronous backend call after cancellable hooks; do not
+pause for the inline-edit session or restore through the success-only rename hook.
+
+### ViewArea Framework
+
+The split-pane editor area, designed around vxcore workspaces:
+
+- `ViewArea2` — QSplitter tree managing split panes (pure view, no business logic)
+- `ViewSplit2` — QTabWidget-based split pane; each instance maps 1:1 to a vxcore workspace
+- `ViewWindow2` — abstract base for file viewer windows; receives a `Buffer2` in its constructor
+
+#### Read-only session recovery
+
+`ViewArea2` saves each buffer's read-only state in workspace `bufferMetadata.readOnly`,
+including before hiding a workspace. Preserve other metadata keys when updating hidden
+workspaces. `ViewAreaController::openRestoredBuffer()` passes the saved flag to
+`BufferService::getBufferHandle()` before constructing any editor. Adoption ORs it with
+the notebook flag and never downgrades an already-read-only shared buffer. Missing keys
+in older sessions default to false; `ViewWindowMode::Read` is not a read-only buffer flag.
+
+#### Search replacement projection
+
+SearchPanel2 owns confirmation/progress/error dialogs; SearchController owns completed-result
+eligibility, immutable selected/all targets, sequential replacement, cancellation and refresh.
+LocationList2 emits value selections from `selectedRows(0)`; empty selection never means All.
+Content keywords preserve whitespace, and replacement text is literal (empty text deletes).
+Confirmation discloses saving existing unsaved edits and no cross-file Undo guarantee.
+
+ViewWindow2 uses `m_contentReplacementFrozen`, separate from encryption conversion. Freeze
+focus sync/close/external prompts without changing permanent read-only state. On changed content,
+refresh each split's editor and Markdown preview before BufferService restores the active writer;
+failed writes display the transformed text as unsaved rather than restoring stale editor text.
+
+The replacement progress dialog stays application-modal until terminal completion, including
+Cancel/Escape/window close while a write is pending. Disconnect QProgressDialog's built-in
+`canceled()` -> `cancel()` connection with matching SIGNAL/SLOT syntax: the typed disconnect does
+not remove Qt's legacy connection, and would hide the dialog before the write settles. Preserve
+the replacement outcome while the captured original search refreshes.
+
+#### Right-hand toolbar slots
+
+`addRightCommonToolBarActions()` keeps primary controls on the toolbar and puts
+secondary actions in a three-dot **Menu** (`menu.svg`):
+
+| Position | What |
+|---|---|
+| spacer | |
+| `addAdditionalRightToolBarActions()` | Markdown: Outline; PDF: sidebar, Outline, Find And Replace, Presentation Mode, page and zoom controls |
+| Find And Replace | Default position; PDF opts out because Find is beside Outline |
+| `addAdditionalViewToolBarActions()` | Text and Markdown: Presentation Mode; MindMap: zoom controls, then Presentation Mode |
+| Menu | Readable Width and Print, when `isPrintSupported()` |
+
+`addAdditionalToolBarMenuAction()` lets PDF reuse its existing menu action; the
+base creates one otherwise. PDF's existing rotate/cursor/scroll/spread/properties
+entries precede a separator and Readable Width. Only viewer-owned entries are
+readiness-gated: Menu and Readable Width remain available during loading/reloading.
+
+`addAdditionalMenuActions()` appends Markdown's Image Host, Live Preview,
+Toggle In-Place Preview, Allow Auto Section Number and Debug after a separator.
+Edit-only/Read-only visibility and encrypted-note restrictions still apply.
+Use the `addAction(QMenu *, ...)` overload for menu actions: it preserves
+window-scoped shortcuts without creating temporary toolbar buttons. The toolbar
+overload owns the remaining direct controls. Theme refresh reaches both.
+
+Text keeps **Find And Replace → Presentation Mode → Menu**. Markdown keeps
+**Outline → Find And Replace → Presentation Mode → Menu**. PDF keeps
+**Outline → Find And Replace → Presentation Mode** together before page/zoom controls.
+MindMap adds Lucide Undo and Redo after the left common actions and keeps
+Outline → Find And Replace → Zoom Out → percentage combo → Zoom In → Presentation Mode → Menu.
+Zoom controls observe the native editor's `zoomChanged` signal and `isZoomFit()`
+state, including new/load reset, deferred explicit Fit, shortcuts and Ctrl+wheel.
+New/open/reload starts at 100%, centering the root after the tab's show/resize layout
+settles. Attach the new window before returning to the event loop. Manual zoom cancels
+pending placement, and later resizes retain the current scale. The empty-canvas context
+menu orders Focus Main Node → Fit → 100% → Zoom In → Zoom Out.
+The dropdown contains only Fit, 100%, 125%, 150% and 200%. Click its arrow for presets;
+the text field accepts a percentage (for example `137.5` or `137.5%`) and Enter applies
+it, using the native manual-zoom limits of 10%–400%. The localized Fit label also works.
+Invalid input or leaving the field without Enter restores the actual zoom without
+applying the draft. Custom values never add preset rows. Opening/reloading a map shows
+100%; explicitly requesting a one-shot fit shows Fit, even when its scale matches a preset.
+Manual zoom/reset switches to the actual percentage, including same-scale mode
+changes, without adding custom entries. Unloaded/invalid content disables
+the zoom controls; read-only maps remain zoomable. The native ViewWindow toolbar
+borrows the editor's editing command actions; the editor retains shortcuts,
+inline-edit commits and history availability. Invalid content gates native mutations through read-only mode until
+a successful reload restores the buffer policy. Widget-hosted Settings and Dashboard
+retain their content-owned toolbars; locked-note placeholders have none.
+
+#### Whole-view fullscreen
+
+`ViewWindow2::setViewFullScreen(bool)` promotes the **existing ViewWindow** to
+frameless fullscreen in place. `ContentFullScreenHost` changes its window flags,
+not its parent or tab registration. Toolbar, content, Find, banners and scoped
+shortcuts keep their normal layout; no container, placeholder or floating exit
+button is created. Readable-width margins are zero during presentation.
+PDF entry defers its adapter commands until native layout settles, activates the
+layout, then sets page-scroll before Page Fit. The webview's remaining height
+already excludes toolbar/Find rows; never subtract a fixed toolbar height.
+A single-shot timer also coalesces native PDF viewport resizes while presenting
+with Page Fit selected, including Find/banner changes. Explicit zoom selections
+are preserved; every confirmed exit cancels the pending fit before restoring
+normal zoom/scroll state.
+
+The existing parent layout is disabled before promotion so QStackedLayout cannot
+resize the fullscreen page during a background layout pass. Exit restores the
+exact saved flags/state, QuitOnClose attribute and layout enabled state. An
+originally disabled layout stays disabled. Normal exits restore visibility/focus;
+external tab hides do not reopen or focus the hidden page. Ownership transfers
+restore under the current parent rather than moving the view back.
+
+- **Escape is filtered at application level**, including ShortcutOverride, to
+  reach Chromium's deeply nested render widget. Only the promoted window's
+  widgets/native target qualify, not separate child dialogs. An owned popup
+  consumes the first Escape; the next Escape requests presentation exit.
+- **Exit is an intent:** Escape, native Close, external hide and removal of native
+  fullscreen emit `exitRequested` / `viewFullScreenExitRequested`. Native Close
+  exits presentation instead of hiding/deleting a registered document tab.
+  `viewFullScreenChanged` reports only confirmed transitions so every exit path
+  restores the PDF zoom/scroll snapshot and toolbar state.
+- **Restore before structural changes:** conversion/replacement freeze,
+  `setCentralWidget()`, `aboutToClose()` and teardown leave fullscreen first.
+  Text/PDF/MindMap teardown exits while derived state and any adapter still exist. Guarded
+  pointers and destruction handling restore surviving parent layouts without
+  touching a dying widget.
+
+Markdown, Text, PDF and MindMap have a checkable **Presentation Mode** action: checked while presenting,
+click again to exit. Its view-scoped shortcut defaults to **F9**, configured through
+`editor.core.shortcuts.PresentationMode`; an empty string disables the shortcut.
+PDF's action remains usable even if the viewer reloads. MindMap presents the existing
+editor without reloading content, changing read-only policy or resetting zoom.
+Each confirmed MindMap presentation entry collapses the node-properties card through
+`MindMapEditor::collapseNodeProperties()`, including with no selected node. Users may
+expand it again while presenting; exit leaves their current card preference unchanged.
+Only the QToolBar gets an opacity effect: **10% inactive, 100% active**. Active
+means the presentation window is active and the toolbar is hovered, contains
+keyboard focus, or owns an open popup (including submenus, zoom and extension
+menus). The effect includes the toolbar's styled background, not only its buttons.
+`PresentationToolBarEffect` shares this policy between Markdown, text, PDF and MindMap. During presentation,
+the views paint the parent backdrop with the theme's `base#content#bg`, so a matching
+toolbar-colored parent cannot mask the fade.
+Theme changes refresh that color; normal mode restores normal frame painting.
+PDF, Find and popup windows remain opaque. Exit removes the effect,
+application filter and focus tracking. Gates: `test_contentfullscreenhost` and
+`test_pdfviewertoolbar`, including tab identity and rendered-alpha regressions.
+
+#### Markdown slides
+
+Markdown Presentation Mode switches Edit to Read through normal buffer synchronization, then
+waits for rendering and reveal.js readiness before confirming native fullscreen. F9 toggles;
+Escape exits. Rendering, page reload, mode/theme changes and export tear the deck down first.
+`presentation.js` moves rendered nodes reversibly; it never reparses or rewrites note source.
+A sole leading H1 opens a title slide with its introductory content. H2 and H3 start slides;
+H3 slides repeat their nearest preceding H2 in a fixed header above the scrollable body.
+Preamble is retained, H4–H6 stay in-flow, and additional H1s reset the H2 association without
+splitting. Headings inside atomic lists, tables and blockquotes are not slide boundaries.
+
+Viewer fold wrappers are traversed without losing their state. Every remaining nested SECTION
+(including display math) becomes a temporary DIV: reveal.js treats all descendant SECTIONs as
+slides. Exit restores original node objects, wrappers, folding, styles and scroll positions.
+The local core and shared black-theme fonts/layout are viewer-only, media-gated styles;
+exported reader CSS excludes them. Each entry selects the black or white reveal.js palette from
+the current VNote content background (`base#content#bg`, backed by system Base for Native,
+with `getBaseBackground()` as fallback for custom themes); Qt `qGray < 128` selects dark.
+The adapter passes that mode explicitly, including
+for protected previews whose reader stylesheet stays light. The white palette is a small scoped
+CSS override, not a duplicate font bundle. Code surfaces and scrollbar color-scheme follow it;
+the light class is restored with the reader's other classes on exit. Theme changes still end
+presentation; the next entry picks the new palette. Protected previews retain their explicit
+bundled-resource allowlist and unchanged CSP. JavaScript must never request HTML5 fullscreen.
+
+**HTML5 fullscreen remains disabled.** Enabling
+`QWebEngineSettings::FullScreenSupportEnabled` advertises it to every web view
+without implementing their transitions, and Chromium requires transient renderer
+user activation that a Qt QAction relayed over QWebChannel does not carry.
+`PdfViewWindow2::setPresentationMode()` drives the native view transition instead.
+
+**The same announce-only trap applies to printing**, and there it is worse:
+`window.print()` in a page only reaches `QWebEngineView::printRequested`, and for
+a pdf.js viewer `QWebEngineView::print()` prints only the pages Chromium has
+rendered. `ViewWindow2::isPrintSupported()` (default **true**) is the opt-out
+hook that keeps a window from inheriting a Print button its `handlePrint()`
+cannot honour; `PdfViewWindow2` is the current opt-out. See
+[pdf.js AGENTS.md § Printing and presentation mode](../data/extra/web/pdf.js/AGENTS.md)
+for why neither print route works there.
+
+- `ViewWindowFactory` (in `../gui/services/`) — registry mapping file types to `ViewWindow2` creators
+
+### Concrete ViewWindows
+
+- `MarkdownViewWindow2` — Markdown editor with preview
+- `TextViewWindow2` — plain text editor
+- `PdfViewWindow2` — PDF viewer. Like `MarkdownViewWindow2`, it overrides
+  `getOutlineProvider()` and feeds the Outline dock + toolbar popup. The JS↔C++
+  outline contract is **index-based**: JS owns the pdf.js `dest` objects and
+  publishes `{ name, level, index }` per entry, where `index` addresses a private
+  destination array on the web side and is `-1` when the entry is not jumpable.
+  It must be carried explicitly — `OutlineProvider::makePerfectHeadings` inserts
+  filler headings, so a heading's position is NOT its destination index. See
+  `src/data/extra/web/pdf.js/pdfviewercore.js` and
+  `tests/widgets/test_pdfviewercore_js.cpp`.
+  pdf.js's own toolbar strip is hidden; its controls are reproduced by
+  `PdfViewerToolBar` (`pdfviewertoolbar.{h,cpp}`) on the view-window toolbar.
+  **`PdfViewerAdapter` is the single source of truth** — the toolbar repaints
+  from `viewerStateChanged`, never optimistically from its own clicks, because
+  the page changes page/zoom/rotation/modes by itself. See
+  [pdf.js AGENTS.md § The viewer-control bridge](../data/extra/web/pdf.js/AGENTS.md).
+- `MindMapViewWindow2` — mind map viewer
+- `WidgetViewWindow2` — generic widget-hosting window
+
+`MindMapEditor::loadContent()` delegates blank-input initialization to m3's `loadJson()`.
+Empty or JSON-whitespace-only files open with the selected **Central topic** root, not a
+blank canvas. Loading leaves the buffer clean and file bytes unchanged; edits/save persist
+the initialized map normally. Invalid nonblank input still fails closed.
+
+`SettingsWidget` adds a right-aligned, text-only **Edit JSON** toolbar action. Resolve
+`vnotex.json` through `ConfigMgr2::getFileFromConfigFolder()` and open it with `BufferService`
+in forced edit mode; do not launch an external editor or depend on a `MainWindow2` pointer.
+Configuration persistence remains owned by `ConfigMgr2`; this action only opens the file.
+
+### MindMap editor settings
+
+Settings → Editor → **MindMap Editor** exposes default fallback font families, point size,
+undo limit, deletion confirmation and automatic colors for new main branches. Apply saves
+`editor.mindMapEditor` and uses `EditorPage::notifyEditorConfigChange()`'s existing one-second
+coalesced hook; editing controls alone changes nothing, and Reset reloads saved values.
+The hook reaches all registered maps, including hidden/detached windows. The wrapper's
+`applyConfig()` updates live policy and style without reloading documents or shortcuts.
+Preserve inline drafts, selection, zoom, dirty state and per-node pixel-size overrides.
+Theme changes still supply the host font/palette; explicit map defaults survive them.
+Shortcuts are JSON-only, loaded on restart. Zoom remains ViewWindow-owned, and resource bases
+and relative-URL resolution remain buffer/encryption-owned, never user preferences.
+
+
+### Automatic section numbers
+
+Markdown windows expose **Allow Auto Section Number** in **Menu**, immediately after
+**Toggle In-Place Preview**.
+The default-on permission lives only in the window's `OutlineProvider`, never in configuration or
+outline snapshots. OFF vetoes read decoration, edit-mode source numbering, and dock/popup outline
+numbering; ON respects each existing global preference. Settings changes, mode changes and new
+outline snapshots must not reset it. Explicitly switching this menu permission OFF also restores
+only source prefixes changed by VNote in the current editor session, as one standalone undo step.
+Overwritten manual prefixes are restored; already-matching/manual prefixes remain untouched.
+Ownership is not inferred on reopen, or transferred through replacement/cut-paste/reorder of
+tracked spans. Exact undo checkpoints can restore their previous lineage. Global preference
+changes, provider clearing and temporary mode suspension remain nondestructive.
+
+Restoration requires a writable, stable, current editor and must not overwrite another split's
+unsaved content. Without an existing editor it does nothing. Unchanged restoration creates no
+source edit, dirty state or revision/cache update; unavailable restoration shows guidance and
+leaves the permission OFF so the user can re-toggle to retry. Read mode uses the same hidden
+document, commits its encoded content and updates the viewer text in place, preserving undo
+history and the top line rather than resetting the page.
+
+Markdown read-mode numbering lives in `src/data/extra/web/js/sectionnumber.js`, not the parser.
+`MarkdownViewerAdapter::sectionNumberOptions` retains per-view enablement and the shared
+`EditorConfig::sectionNumberPattern` across page resets. Edit previews disable decoration;
+mode and settings changes update the property even when the content revision is unchanged.
+The worker runs before heading extraction and defers completion until the mapper has published.
+It owns only its prefix spans, preserving source text, inline nodes and heading anchors.
+The required script is appended after configured viewer dependencies by `HtmlTemplateService`;
+older custom resource arrays must not omit it. Export resources do not include it.
+
+The outline's independent Auto Section Number toggle uses `SectionNumberUtils` with the same
+policy: exempt a sole leading H1, inspect up to five remaining actual headings for numeric
+prefixes, and otherwise number from the minimum eligible level. `Outline::m_hasSectionNumber`
+is an authoritative producer guarantee, not a preference; true bypasses panel detection and
+numbering. `Heading::m_isPlaceholder` marks only synthesized level gaps: never infer it from
+`[EMPTY]`, an empty anchor, or a missing PDF destination. Preserve both flags across snapshots.
+The outline controller refreshes the shared pattern on `ConfigEditorChanged`, including open
+popup outlines, without mutating producer names.
+
+### Markdown concealment
+
+Settings → Markdown Editor → Edit exposes **Conceal long link destinations**. It stores
+`editor.markdown_editor.concealment`, defaulting to `true`; older configurations inherit that
+default through `ConfigMgr2`'s merge. `applyMarkdownConfigFields()` maps both editor-config
+builders: disabling clears vtextedit's concealment flags, while enabling retains its image, link,
+and reference URL flags and length threshold. `ConfigEditorChanged` refreshes open editors.
+Concealment is visual only: never rewrite the Markdown source; hover shows the full destination.
+
+Every bundled `text-editor.theme` defines `markdown-editor-styles.ConcealedText` with foreground
+and background colors. `ThemeService` resolves palette tokens before vtextedit loads the theme.
+
+### PlantUML pagination
+
+`src/data/extra/web/js/plantuml.js` owns page enumeration for both read mode and editor previews.
+Read mode keeps separate, individually viewable images; previews stack PNG pages vertically into
+one image, preserving page titles and pixels. Do not inject `ignore newpage`: it is invalid for
+non-sequence diagrams. The note source is never rewritten.
+
+Web sequence diagrams use indexed SVG/PNG requests. Other identified diagram types retain
+single-image web rendering because some servers ignore their index. HTTP 400 without an image
+marks the end; the legacy HTTP 509 sequence-title index exception is matched narrowly, not as a
+generic server-error fallback. Local rendering uses `-pipeimageindex N` and successful empty
+stdout as the end marker; custom PlantUML commands must accept the appended index argument.
+`GraphHelper` carries success separately from image data and includes the image index in its
+cache key, including cached empty end markers.
+
+SVG responses are parsed as inert XML and validated before joining the page list; the SVG list
+contains SVG elements, while PNG lists contain base64 strings. Never parse renderer responses as
+HTML: a failed HTML response can execute image handlers even in a detached fragment. Raster-only
+backends such as Ditaa may label PNG bytes as SVG; reject that mismatch locally and recommend PNG.
+On failure without valid pages, preserve the original code subtree and annotate it with an error
+tooltip. Do not rewrite its text or discard its highlighting. Failure to display partial results
+must also remain local and settle the node exactly once.
+
+Enumeration is bounded to 256 pages. Failures or the cap retain available read-mode pages with
+an incomplete-render warning; editor previews do not silently publish partial results. Protected
+notes remain blocked. `test_graphrenderer_js.cpp` covers web termination, error retention, the cap,
+and preview pixels in QtWebEngine, since QJSEngine does not support async/await.
+
+### Math font readiness
+
+`MathRenderer.waitForMathFonts()` first measures the math node so its used web fonts begin loading,
+then waits only for loading `KaTeX_*` faces through their `FontFace.loaded` promises. The raster
+path measures again after those fonts settle. Read rendering, in-place rasterization and raster
+export all use this boundary; they must not await `document.fonts.ready`. That document-wide
+promise includes unrelated fonts and post-layout work, which can remain pending indefinitely in
+the hidden Edit Only viewer. Do not replace this with a delay, a visibility toggle, or a blanket
+prefetch of unused fonts. The native hidden-page regression in `test_markdownviewer_js.cpp` holds
+global readiness and an unrelated font pending while requiring math to wait for its own font and
+then finish reading, PNG preview and export.
+
+### Toolbar
+
+- `ToolbarHelper2` — main window toolbar construction
+- `ViewWindowToolbarHelper2` — per-view-window toolbar construction
+
+Theme changes must retire `PreviewHelper`'s cached math/diagram rasters before applying editor
+styles and reloading the viewer. Re-request previews through `MarkdownEditor::refreshPreviewHighlight()`
+when the new viewer reports ready, as for renderer-setting changes. `PreviewMgr::refreshPreview()`
+alone does not invalidate `PreviewHelper`'s renderer-dependent cache.
+
+### Dialogs (`dialogs/`)
+
+- `NewNoteDialog2`, `NewFolderDialog2`, `NewNotebookDialog2`
+- `ManageNotebooksDialog2`, `ImportFolderDialog2`
+
+Each dialog is driven by a corresponding controller in `../controllers/`.
+
+`NewNotebookDialog2` and `ManageNotebooksDialog2` share `NotebookInfoWidget`. The form owns
+field layout and editability; dialogs/controllers retain creation, sync, validation and persistence.
+Root and type are immutable after creation. Sync method sits below Type, editable only during
+creation; management shows selectable read-only text and hides Configure. Unsupported fields stay
+visible but non-editable; read-only text remains selectable. `setNotebookInfo()` populates or resets
+fields without emitting `inputEdited()`, so loading a notebook never dirties the management dialog.
+Creation evaluates name snippets; editing an existing notebook preserves its literal name.
+New-notebook sync failures display both `SyncErrorPresenter` guidance and nonempty backend
+details in the existing plain-text information area; details must not be confined to debug logs.
+
+### Search / Snippet / Tag
+
+- `SearchPanel2`, `SnippetPanel2`
+- `TagExplorer2`, `TagViewer2`, `TagPopup2`
+
+### Dashboard (`dashboard/`)
+
+The home dashboard shown at `vx://home`. Pure **view** layer — all layout logic
+and persistence live in `DashboardController` (`../controllers/`).
+
+- `DashboardContent` — `IViewWindowContent` host at `vx://home`; owns the board
+- `DashboardBoard` — fixed-column `QGridLayout` of stickers; creates/owns its
+  `DashboardController`, forwards user gestures as intents, and reacts to
+  controller signals to build/move/remove sticker frames
+- `Sticker` — abstract sticker content widget; `CalendarSticker` is the concrete built-in
+- `StickerFactory` (in `../gui/services/`) — registry mapping sticker type-ids to creators
+
+#### Edit mode (unlocked): drag-move / drag-resize
+
+Locked is the default and is unchanged: no overlay widget exists at all. **Unlocked
+means edit mode**, and that has four normative consequences:
+
+- Each realized sticker gets a `StickerDragOverlay` child of its chrome frame,
+  covering everything **below the header band** (`ViewItem::m_header`, handed
+  back by `buildFrame`). It **swallows every mouse event over the sticker
+  content** — clicking a calendar date or a history row while unlocked does
+  nothing — while the header stays live. The header holds **only Remove**: the
+  Move menu (Move Up/Down/Left/Right + `Resize...`) and `ResizeStickerDialog`
+  were deleted, because direct manipulation plus the overlay's keyboard route
+  replaces both. `moveSticker()` on the controller is still the commit path for
+  a keyboard move.
+  The overlay is created on unlock and `hide()` + `deleteLater()`d on lock, in
+  that order (a queued deletion would otherwise leave a swallowing overlay alive
+  across a fast lock/unlock).
+- **The controller is the single source of truth for normalization.**
+  `DashboardController::previewStickerGeometry` applies the same `qBound` clamps
+  `setStickerGeometry` applies (the setter now calls it), so the ghost
+  (`StickerDropIndicator`) always shows exactly what a commit would produce.
+  Out-of-bounds drops are **clamped**; drops onto an occupied region are
+  **rejected** (ghost renders invalid, release is a no-op — the existing
+  reject-and-noop collision policy). `stickerDragTarget()` in
+  `stickerdraggeometry.{h,cpp}` is pure math and deliberately does **not** clamp
+  to board bounds; do not add board knowledge there.
+- Geometry is committed **once, on release** — exactly one `setStickerGeometry`
+  (and therefore one persist) per gesture. `DashboardBoard::cancelDragSession()`
+  is the single synchronous, idempotent teardown; it must be called from lock,
+  sticker removal, layout reload / `clearAllViews`, `dragCancelled` (Esc or a
+  right-click mid-drag) and the destructor.
+- **The overlay is also the keyboard route, and must stay one.** It is
+  focusable, so Tab reaches every unlocked sticker; arrow keys emit
+  `moveRequested` and Shift+arrows `resizeRequested`, which the board commits
+  through `moveSticker` / `setStickerGeometry` — the same clamp and collision
+  policy as a drag, no ghost. A focused overlay paints a solid border instead of
+  a dashed one, and carries an accessible name (the sticker title) plus a
+  description of the keys. Direct manipulation removed the header Move menu and
+  the resize dialog, which were the only keyboard-operable affordances; do not
+  remove this replacement without providing another one. Keyboard input is inert
+  while a mouse session owns the geometry.
+
+`StickerDragOverlay` and `StickerDropIndicator` are leaf presentational widgets:
+**no `ServiceLocator`** (precedent `InlineBanner`). The board resolves the accent
+(`base#info#fg`) and invalid (`base#error#fg`) colors from `ThemeService` with a
+`QPalette` fallback and injects them; both widgets paint with `QPainter` and
+never touch a stylesheet, so nothing here can trip (or need to dodge) the
+hardcoded-color gate. The centre move affordance is the themed `move.svg` icon,
+tinted with the accent and injected the same way (`setMoveIcon`) — the overlay
+cannot resolve a theme icon itself. `DashboardBoard::refreshEditModeColors()`
+re-injects both on a theme change; without it live overlays keep the old accent.
+
+While a drag targets rows below the occupied extent, the board reserves them via
+`m_dragRowReservation` and re-runs `applyRowSizing()`, otherwise the container
+has no height there and the ghost is clipped. The reservation only extends
+`maxRow`; per-row height stays `kRowUnitHeight` so frames keep matching their
+cells exactly.
+
+### Other
+
+- `LocationList2` — results list (search hits, backlinks, etc.)
+- `FindAndReplaceWidget2` — in-editor find/replace bar
+- `AttachmentPopup2` — attachment management popup
+- `WordCountPopup2` — word/character count display
+- `NotificationButton2` / `NotificationPopup2` — toolbar notification button + popup (see below)
+
+## Notification System
+
+The in-app notification UI is the **View** layer over `NotificationService` (data/signals only, `src/core/services/notificationservice.{h,cpp}` — Qt-Widgets-free). Producers are wired in `NotificationRouter` (`src/controllers/notificationrouter.{h,cpp}`) and `UpdateController`; deciding which subsystems emit is out of scope of the widgets.
+
+Three surfaces, one rule each:
+
+- `NotificationToast` (`notificationtoast.{h,cpp}`) is the **transient** surface for `Attention::Interrupt`. It is a plain **child `QFrame` of `MainWindow2`**, anchored bottom-right of the central widget — NOT a `QMenu` and NOT a `Qt::Tool` top-level. A child widget cannot take window activation, so an arriving toast can never eat the user's keystrokes; being a child (rather than a `Qt::Tool` window) also avoids the Windows native-unmap-on-deactivate quirk, multi-monitor clamping and taskbar overlap.
+- `NotificationButton2` (`QToolButton`) lives on the settings toolbar immediately after the Settings menu. It paints a red badge with `NotificationService::activeCount()` and refreshes its bell icon on `ThemeService::themeChanged`. It **does not auto-show the popup** — `showPopup()` is called on click, or by `MainWindow2` forwarding `NotificationToast::popupRequested`.
+- `NotificationPopup2` (extends `ButtonPopup`) is the click-to-open **notification centre**: messages newest-first with severity icon + title + text + optional collapsible "Details" + optional progress bar + per-message action buttons + Dismiss, in a height-capped `QScrollArea`, under the shared `TitleBar` holding "Notifications" and Clear All. Do NOT hand-roll a titlebar.
+
+The popup list has a minimum height of 12 font line spacings, clamped to its screen-height cap.
+Keep this floor on the scroll area so the `QWidgetAction` size hint reserves usable list space.
+
+### Attention → surface routing (owned by `NotificationToast`)
+
+The routing table lives INSIDE the toast rather than in `MainWindow2`, so it is unit-testable against the real widget instead of a duplicated copy. `MainWindow2` injects the two window-policy inputs:
+
+- `setCanShowInWindow(...)` — must be `isVisible() && !(windowState() & Qt::WindowMinimized)`. **`isVisible()` alone is not enough**: a minimized top-level window is still logically visible, so an in-window child would be "shown" where the user cannot see it.
+- `setFallbackSink(...)` — where an `Interrupt` goes when the above is false. `MainWindow2` routes it to `QSystemTrayIcon::showMessage()` (title + text only; a balloon carries no actions and cannot be retracted).
+
+| Signal | Condition | Toast action |
+|---|---|---|
+| `messageAdded` | `Interrupt` | show (or fall back to the sink) |
+| `messageAdded` | `Passive` | nothing |
+| `messageUpdated` | shown id, `Interrupt` | refresh content, **do not** restart the timer |
+| `messageUpdated` | shown id, `Passive` | **hide** (the producer downgraded it; leaving stale interrupting content up would show a stale action button) |
+| `messageUpdated` | any other id | nothing |
+| `messageDismissed` / `messageRemoved` | shown id | hide |
+| `messagesCleared` | always | hide |
+
+**A `messageAdded` carrying `Interrupt` is the ONLY thing that raises the toast.** A producer that must re-interrupt an ongoing incident calls `NotificationService::renotify()`, which removes the old generation and posts a new one. See `src/core/services/AGENTS.md` § NotificationService for why there is no escalation signal.
+
+`renotify()` always changes the id, so it necessarily runs `messageRemoved(old)` → hide, then `messageAdded(new)` → show. Under the current GUI-thread-only producer contract both deliveries are direct and synchronous, so the pair completes before a repaint and no blank frame is rendered. **Keep these plain `hide()`/`show()` calls** — adding a fade, animation or deferred teardown would turn that into a visible flicker. The accepted cost of this two-signal protocol is that a *visible* popup rebuilds twice and the badge recomputes twice per `renotify()`.
+
+### Progress and in-place updates
+
+A message renders a `QProgressBar` when `NotificationMessage::m_progressIndeterminate` is
+set (range `0..0`, busy indicator, wins over the permille) or `m_progressPermille >= 0`
+(range `0..1000`, clamped). Permille rather than percent, so a long-running producer with a
+byte count still moves the bar smoothly.
+
+The popup rebuilds on `messageAdded` / `messageUpdated` / `messageDismissed` /
+`messageRemoved` / `messagesCleared` / `themeChanged`, but **only when it is already
+visible**. `messageAdded` is in that list deliberately: nothing auto-pops any more, so
+without it an open popup would go stale.
+
+`NotificationAction::m_dismissOnTrigger` (default `true`) controls whether triggering the
+action dismisses the message. Producers that keep updating one message in place set it
+`false`.
+
+`m_details` is rendered as a collapsible disclosure in the **popup list only** — never in
+the toast or the tray balloon, both of which must stay small. It is the home for the error
+blobs that used to be a `QMessageBox::setDetailedText` (or were lost to `qWarning`).
+
+### Per-severity accent
+
+Rows and the toast set `PropertyDefs::c_state` (`info` / `warning` / `error` / `success`),
+driven by the shared `*[State="..."]` rules every theme defines, and tint their severity
+icon with `@base#<state>#fg`. When adding a theme, carry all four states plus a
+`vnotex--NotificationToast` block forward; `tests/core/test_theme.cpp`
+(`testInterfaceQssFullyResolved`) is the gate.
+
+### Lifetime-safety rules (MUST FOLLOW)
+
+`NotificationAction::m_callback` is arbitrary application code. Neither the popup nor the toast keeps a copy of it across a rebuild:
+
+- Rows are rebuilt from `service.messages()` on every show and on the signals above, so a stale row's callback can never fire after `clearAll()`.
+- Action buttons capture only the message id + action index and re-resolve the callback from the **current** service state at click time (a cleared/dismissed/removed message becomes an inert no-op).
+- The callback AND its `m_dismissOnTrigger` flag are snapshotted in that **same** lookup, before the callback runs. Do NOT re-resolve the action index afterwards: a callback may synchronously replace the action vector, so a second lookup would read a different action's flag.
+- Because a callback may synchronously destroy the widget, every post-callback access to `this`/`m_services` is guarded with a `QPointer`. The callback may also have already triggered a rebuild via `messageUpdated`, so nothing after it may touch the row widgets that existed when the lambda started.
+
+`Duration` controls only auto-hide (`Short` 3 s, `Long` 60 s, `Persist` = capped at 30 s **on the toast only**, so a toast is never permanently stuck); it does NOT affect memory retention. Messages stay in the in-memory list until dismissed, cleared, or evicted by the retention cap.
+
+
+
+## Inline Notification Banners
+
+Use `InlineBanner` (`src/widgets/inlinebanner.{h,cpp}`) for any inline
+notification strip — an in-editor prompt above the content, a "results
+truncated" warning above a list, a dialog-level notice. Do NOT hand-roll a
+`QLabel` with an inline stylesheet; that is exactly the drift this class
+replaces (it previously existed twice, in `LocationList2` and the legacy-image
+bar, with copy-pasted `#FFF3CD` / `#856404` hex that looked wrong in all six
+dark themes).
+
+`InlineBanner` is a **pure view**: a wrapping message plus zero or more trailing
+action buttons. It takes no `ServiceLocator` — it has no service needs, matching
+the other leaf presentational widgets (`EncodingButton`, `StatusBar`). Consumers
+own all policy.
+
+```cpp
+auto *banner = new InlineBanner(InlineBanner::Severity::Warning, tr("..."), this);
+connect(banner->addActionButton(tr("Fix It")), &QPushButton::clicked, this, &X::onFix);
+addTopWidget(banner);   // ViewWindow2 host; or any QLayout elsewhere
+```
+
+`addActionButton()` returns the `QPushButton` it created (the
+`QDialogButtonBox::addButton` convention) so the caller connects it directly —
+there is no index bookkeeping and no signal the banner has to re-emit.
+
+For a feature-specific banner, subclass it and keep the copy plus the named
+intents in the subclass (see `LegacyImageMigrationBar`). Never put the strings
+in the hosting view window.
+
+### Theming (do not bypass)
+
+Severity is published as the `BannerSeverity` dynamic property
+(`PropertyDefs::c_bannerSeverity`, values `info` / `warning` / `error`), set via
+`WidgetUtils::setPropertyDynamically` so the style engine repolishes. Every
+bundled theme styles it:
+
+```qss
+vnotex--InlineBanner { background-color: @base#normal#bg; ... }
+vnotex--InlineBanner[BannerSeverity="warning"] { border-left: 3px solid @base#warning#fg; }
+```
+
+The block uses **only** `@base#` tokens, because those are the only ones every
+theme defines — `native` has no `widgets.qwidget` section, and only `danger`
+has a background role, so info/warning/error are carried by the left rule
+rather than a tinted fill.
+
+**When adding a theme, carry the `vnotex--InlineBanner` rules forward.** A
+missing palette key does not fail loudly: `Theme::translateStyleByPalette` logs
+a `qWarning` and leaves the literal `@base#...` in the stylesheet, after which
+Qt's CSS parser silently drops the declaration. Two data-driven gates in
+`tests/gui/test_themeservice.cpp` cover this for all 12 themes —
+`interfaceQssFullyResolved` (no unresolved token survives) and
+`interfaceQssStylesInlineBanner` (the selector and both severity rules exist).
+
+`InlineBanner` sets `Qt::WA_StyledBackground`; without it a bare `QFrame`
+subclass ignores `background-color` from the global stylesheet.
+
+Note that the primary instance copies themes into `<appData>/themes` after
+acquiring `SingleInstanceGuard`; rejected secondary launches never mutate the
+resource tree. Themes are refreshed only when the per-folder stamp
+`<appData>/themes/.vnote-extra-version` does not match
+`ConfigMgr2::c_version`, so QSS edits reach an existing installation only at the
+next version bump (`scripts/update_version.py` handles that). The stamp is
+written by `FileUtils2::installVersionedDir` **only after the folder copied
+completely**, which is what makes a partial copy retry on the next launch
+instead of being remembered as done; deleting the stamp (or the folder) forces a
+re-copy at the next start. For local work, run with `--watch-themes` and edit
+the deployed copy.
+
+## No Hardcoded Colors in C++
+
+**Never put a literal color in a `setStyleSheet()` call.** VNote ships 12
+themes, 6 of them dark, and the global stylesheet is applied on `QApplication`
+(`main.cpp:725`) and re-applied on every theme change. A hardcoded
+`background-color: #FFF3CD` is correct only in whichever theme its author
+happened to be running, and it cannot follow a theme switch.
+
+This is enforced: `tests/utils/test_hardcoded_color_drift.cpp` parses every
+`.cpp`/`.h` under `src/`, extracts the string literals (comment-aware, raw-string
+aware, and **coalescing adjacent literals** the way the compiler does), and fails
+when one contains **both** a CSS color property and a literal color value — a
+`#hex`, a numeric `rgb()/rgba()/hsl()/hsla()/hsv()/hsva()`, or any name in
+`QColor::colorNames()` except `transparent`.
+
+Use, in order of preference:
+
+| Need | Do this |
+|---|---|
+| A notification strip | `InlineBanner` (see above) — already themed |
+| Severity-colored **text** | Set the `SeverityText` property (`PropertyDefs::c_severityText`, values `info`/`warning`/`error`) via `WidgetUtils::setPropertyDynamically`; every `interface.qss` maps it to `@base#{info,warning,error}#fg`. An unset/empty value falls back to the normal color. |
+| Muted / secondary / hint text | Set the `MutedText` property (`PropertyDefs::c_mutedText`, value `true`). Add italics with `QFont::setItalic`, not QSS. |
+| Anything else static | Add the rule to each theme's `interface.qss`, selecting on the class name (`vnotex--YourWidget`) or a dynamic property. This is the only option that re-themes for free. |
+| A color computed at runtime | `ThemeService::paletteColor("widgets#foo#bg")` interpolated with `.arg()`, as in `NavigationMode::generateNavigationLabelStyle`. A style string whose color comes from a `%N` placeholder is not flagged. |
+
+**Do NOT use `setEnabled(false)` to mute text.** It advertises
+`QAccessible::State::unavailable` for what is ordinary informative text, and it
+does not even work here: every theme styles `QLabel { color: ... }`
+unconditionally with no `:disabled` variant, so the palette's disabled role
+never reaches the label. An attribute selector such as `*[MutedText="true"]`
+outranks the plain type rule, which is why the property works where the disabled
+state does not.
+
+`MutedText` resolves to each theme's dedicated `base.muted.fg`, **not** to
+`base.disabled.fg`. The disabled role is tuned for disabled *controls* and is
+far too faint for enabled text — on `solarized-light` it is `#DAD3C2` over
+`#FDF6E3`, about **1.38:1**. The `base.muted.fg` values are derived by blending
+the theme's normal foreground toward its background until the WCAG contrast
+floor is hit, and `TestThemeService::mutedTextIsReadable` asserts the resolved
+ratio per theme: at least `min(4.5, contrast(normal.fg, normal.bg))`, and never
+*more* contrast than normal text. (`native` is skipped — it takes the OS's own
+muted color from the system palette at runtime.) When adding a theme, add
+`base.muted.fg` and let that test tell you whether the value is legible.
+
+What is **not** an offender, and is not flagged:
+
+- A color literal used as **data** rather than chrome — the mark-node swatch
+  palette (`marknodedialog2.cpp`), the notebook avatar colors
+  (`notebookselector2.cpp`), and `CommentColorSwatch`
+  ([`../gui/AGENTS.md § CommentColorSwatch`](../gui/AGENTS.md#commentcolorswatch)),
+  which paints the comment-colour chip with `QPainter` and offers colors *to*
+  the user.
+- A colorless style string, e.g. `"QLabel { font-style: italic; }"`. (Prefer
+  `QFont` anyway; and for the menu indicator use the `NoMenuIndicator` property
+  documented above, not an inline stylesheet.)
+
+Known scope limits, so nobody mistakes a green build for a proof: the gate
+covers **stylesheet strings only**. A `QColor` painted directly in a
+`paintEvent` or a `QStyledItemDelegate` is out of scope, and a color assembled
+at runtime from a non-literal constant is indistinguishable from the legitimate
+`paletteColor()` pattern without real type analysis. Those still need review.
+
+If you genuinely need a literal, append `// hardcoded-color-allow: <reason>` to
+any line the literal spans. Use it sparingly — every existing case was
+removable.
+
+## Every Palette Token Must Exist in Every Theme
+
+`ThemeService::paletteColor()` returns an **empty string** for a token no theme
+defines — it only `qWarning`s. Interpolated into a stylesheet, Qt then drops the
+declaration; handed to `QColor`, the color is invalid.
+
+`tests/core/test_theme.cpp::testCppPaletteTokensDefined` scans `src/` for every
+string literal shaped like a palette path (`base#…`, `widgets#…`, `palette#…`)
+and fails the build if any bundled theme does not resolve it. It is shape-based,
+so bare `"..."` literals, `QStringLiteral(...)` and file-scope `c_*` constants
+are all covered. Its sibling `testInterfaceQssFullyResolved` does the same for
+tokens named in `interface.qss`; both share one resolver so they cannot drift.
+
+Adding a token means adding it to **all** themes under
+`src/data/extra/themes/`. Prefer an existing role — `base#normal#border`, not a
+new `base#border`. `native` is the smallest palette (no `base.content`, no
+`base.hover`); a copy-paste from `pure` will produce dangling refs the gate
+catches. Themes that declare `"backfill-system-palette": true` may leave
+`@palette#active#<role>` / `@palette#disabled#<role>` leaves to
+`ThemeUtils::backfillSystemPalette`, but only for the roles that function
+actually creates — `@palette#inactive#…` and a misspelled role both fail.
+
+If the token is a deliberate **probe** with its own fallback, call
+`ThemeService::optionalPaletteColor()` (no warning) and append
+`// palette-token-optional: <reason>` to any line the literal spans.
+`DockWidgetHelper::getDockIcon` is the reference case.
+
+## MVC Rule for Widgets
+
+See [MVC Rules](../../AGENTS.md#mvc-rules-must-follow) — Key rule for widgets: **All layers receive `ServiceLocator&`** via constructor injection (enables DI and testing).
+
+Widgets are the **View** layer. They display data and emit signals but **MUST NOT** modify data directly. Business logic belongs in controllers; data access belongs in services.
+
+## ViewArea2 Framework
+
+For ViewArea2 framework design decisions (splitter orientation, session layout persistence, etc.), see [Key Design Decisions (ViewArea2 Framework)](../AGENTS.md#key-design-decisions-viewarea2-framework).
+
+The orchestrator for all open/close/split/move operations is `ViewAreaController` in `../controllers/`.
+
+## NotebookExplorer2: Sync Button State
+
+`NotebookExplorer2::updateSyncButtonState` (`src/widgets/notebookexplorer2.cpp:1512-1665`) paints the per-notebook sync button and Sync Info menu. It classifies the current notebook into one of the 8 sync states (see [Sync State Model](../core/services/AGENTS.md#sync-state-model)) and sets the `partialSyncConfig` QWidget property, which downstream QSS reacts to.
+
+### Classifier
+
+`partialSyncConfig` is set to `true` for any non-ready state inside the `syncEnabled && syncReady` branch (`notebookexplorer2.cpp:1614-1628`):
+
+| State | Detected by | Reason |
+|---|---|---|
+| S1 (no URL/backend) | `syncEnabled && (backend.isEmpty() || remoteUrl.isEmpty())` | Incomplete disk config |
+| S2 (PAT missing) | `syncEnabled && syncReady && !credStore->hasCredentials(id)` | Disk-complete but no keychain entry |
+| S4 (not registered) | `syncEnabled && syncReady && !syncSvc->isSyncRegistered(id)` | Disk-complete, PAT present, but vxcore runtime never registered |
+| S5 (ready) | `syncEnabled && syncReady && hasCredentials && isRegistered` | partialSyncConfig=false; tooltip "Sync Now" |
+
+Use `SyncCredentialsStore::hasCredentials(id)` (cached, paint-safe per W2.T0) instead of `retrieveCredentials`. Keychain access on every paint event is too expensive. Use `SyncService::isSyncRegistered(id)` (synchronous runtime query) for S4 detection.
+
+Do not rename or remove the `partialSyncConfig` property: downstream QSS depends on it.
+
+### Tooltip Variants
+
+The button tooltip changes per state to give the user actionable guidance:
+
+| State | Tooltip | Action on click |
+|---|---|---|
+| S5 | "Sync Now" | Triggers sync |
+| S1/S2/S4 (partial) | Includes "credentials" or "initializ" hint | Opens `NotebookSyncInfoDialog2` in dialog's auto-detected mode |
+| S0 | "Enable Sync" | Opens `NotebookSyncInfoDialog2` with `setBootstrapMode(true)` and empty fields |
+| Reconcile error | Existing tooltip + `"Last sync init failed: error code %1"` appended | Same as the underlying partial/ready state |
+
+The reconcile error code is stored in `m_lastReconcileError` (in-memory `QHash<QString, int>`, `notebookexplorer2.h:201`) populated by `SyncService::reconcileFinished` (`notebookexplorer2.cpp:130-140`) and cleared on `syncFinished` success or notebook switch. No persistence to disk; no toast/modal.
+
+### Re-enable UI Affordance for S0
+
+Without this affordance, users who disable sync can never re-enable without recreating the notebook. The Sync button and Sync Info menu remain visible AND clickable for S0 notebooks (`notebookexplorer2.cpp:1602-1635`):
+
+- Button enabled regardless of `syncEnabled`; label changes to "Enable Sync" when `syncEnabled == false`.
+- `onSyncButtonClicked` branches on `!syncEnabled` → opens `NotebookSyncInfoDialog2` with `setBootstrapMode(true)` (dialog hides the Disable button in this mode).
+- Sync Info menu action enabled regardless of `syncEnabled` (was previously `setEnabled(syncEnabled)`).
+
+The dialog's bootstrap-mode dispatch (`notebooksyncinfodialog2.cpp` accept/apply handlers) routes the user's inputs through `NotebookSyncInfoController::bootstrapApply` rather than `applyChanges`, performing the atomic enable that takes a clean S0 to S5 in one shot.
+
+## Widget Construction Pattern
+
+The migration off the legacy singleton architecture (`VNoteX::getInst()`, `ConfigMgr::getInst()`, the legacy `MainWindow`/`Buffer`) is complete; those types have been removed. All widgets, controllers, models, and views take their dependencies via constructor injection with `ServiceLocator&`. Follow this pattern for new code:
+
+```cpp
+// Receives dependencies via constructor
+class MyWidget : public QWidget {
+  Q_OBJECT
+public:
+  explicit MyWidget(ServiceLocator &p_services, QWidget *p_parent = nullptr);
+
+private:
+  ServiceLocator &m_services;
+
+  void doSomething() {
+    auto &config = m_services.get<ConfigCoreService>();
+    auto &notebooks = m_services.get<NotebookCoreService>();
+  }
+};
+```
+
+### Checklist for a new widget
+
+- [ ] Add `ServiceLocator &p_services` as the first constructor parameter
+- [ ] Store reference: `ServiceLocator &m_services`
+- [ ] Resolve dependencies via `m_services.get<XxxCoreService>()` — never global state
+- [ ] Have the parent widget pass its `ServiceLocator&` down
+- [ ] Register the file in the relevant `CMakeLists.txt`
+- [ ] Write a unit test with mock services
+
+## Related Modules
+
+- [`../core/AGENTS.md`](../core/AGENTS.md) — ServiceLocator, services injected into widgets
+- [`../controllers/AGENTS.md`](../controllers/AGENTS.md) — Controllers that handle widget-initiated actions
+- [`../views/AGENTS.md`](../views/AGENTS.md) — Views embedded in widgets
+- [`../gui/AGENTS.md`](../gui/AGENTS.md) — GUI services and utilities used by widgets
+- [`../../AGENTS.md`](../../AGENTS.md) — Architecture overview, MVC rules, ViewArea2 design decisions
+
+## Comment dock (`CommentPanel` + `CommentProvider`)
+
+The comment dock is a deliberate clone of the Outline dock's shape, so that adding comments to a
+second file type needs no dock work at all.
+
+- `ViewWindow2::isCommentsSupported()` defaults to false; only `PdfViewWindow2` opts in.
+  `getCommentProvider()` returns null by default. `MainWindow2` switches providers before updating
+  visibility on `currentViewWindowChanged`, so pending edits flush to the original provider.
+  Unsupported views (including no current view) hide Comments and disable its dock/menu toggle.
+  Switching to a PDF shows Comments, except while Expand Content Area hides non-floating,
+  non-kept docks. Startup restoration and expand/collapse apply the same capability gate.
+  Fresh/reset layouts defer the default Outline/Comments split until both docks can be sized;
+  successfully restored layouts retain their saved proportions.
+- `CommentProvider` is a pure DATA + SIGNALS object. It holds a `CommentSet` and a selection, and
+  carries the view's intents (`activateRequested`, `textEditRequested`, `colorChangeRequested`,
+  `deleteRequested`) outward. **It never writes the store and holds no service** — every mutation
+  belongs to `CommentController` (`src/controllers/`), per the "views never modify data" rule.
+- `CommentPanel` is a pure view over whatever provider it currently holds. Two details are
+  load-bearing: it guards every programmatic repaint with `m_updating` so a `setPlainText` /
+  `setCurrentIndex` cannot echo an intent straight back, and it **flushes a pending keystroke
+  before switching providers**, or the edit would be applied to a different file's comment.
+- A comment whose `anchor.type` this build does not implement is listed (with an explanatory
+  tooltip) but not rendered on the page. It is still carried through `comments.json` untouched.
+- **The dock is a destination, not an entry point.** Comments are created on the PDF page:
+  select text, right-click, **Highlight ▸ <color>** (`PdfViewer::contextMenuEvent` emits
+  `highlightSelectionRequested`, which `PdfViewWindow2` routes to the adapter). Alt+drag is a
+  shortcut only. A `pdf-freetext` box is additionally edited **on the page** — its body is
+  `Comment::m_text`, so the dock editor and the box's inline editor are the same operation
+  (see [pdf.js AGENTS.md § The Text tool types ON THE PAGE](../data/extra/web/pdf.js/AGENTS.md)).
+  If you add comments to another file type, give it a discoverable affordance too —
+  an empty dock with no visible way to fill it reads as a broken feature.
+
+Adding a dock is four edits — `DockType` enum (order must match `m_docks`), `MainWindow2::setup*`,
+`MainWindow2::getDockWidget()`, `DockWidgetHelper::setupDocks()` + `iconFileName()` + an icon in
+`src/data/core/icons/` registered in `core.qrc`.
+
+Store contract: [`../core/services/AGENTS.md` § Comment store](../core/services/AGENTS.md#comment-store-commentsjson).
