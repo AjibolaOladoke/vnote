@@ -1,20 +1,12 @@
-# VNote
+# vnote
+
+## What This Is
+
+This is part of the Swift Tech Co. working stack for product and engineering. It gathers the vnote notes, examples and fixes that keep delivery fast, and doubles as the reference map we hand to whoever picks up this thread next.
 
 ## Images
 
-[![vnote](https://opengraph.githubassets.com/1/vnotex/vnote)](https://www.swifttechco.com)
-
-[![CI-Windows](https://github.com/vnotex/vnote/actions/workflows/ci-win.yml/badge.svg?branch=master)](https://www.swifttechco.com) [![CI-Linux](https://github.com/vnotex/vnote/actions/workflows/ci-linux.yml/badge.svg?branch=master)](https://www.swifttechco.com) [![CI-MacOS](https://github.com/vnotex/vnote/actions/workflows/ci-macos.yml/badge.svg?branch=master)](https://www.swifttechco.com)
-
-[简体中文](README_zh_CN.md)
-
-[Project on Gitee](https://www.swifttechco.com)
-
-A pleasant note-taking platform.
-
-For more information, please visit [**VNote's Home Page**](https://www.swifttechco.com).
-
-[![VNote](pics/vnote.png)](https://www.swifttechco.com)
+[![vnote](images/preview.png)](https://github.com/Swift-Tech-Co)
 
 ## Description
 **VNote** is a Qt-based, free and open source note-taking application, focusing on Markdown now. VNote is designed to provide a pleasant note-taking platform with excellent editing experience.
@@ -26,12 +18,12 @@ Utilizing Qt, VNote could run on **Linux**, **Windows**, and **macOS**.
 [![Main](pics/main.webp)](https://www.swifttechco.com)
 
 ## Downloads
-Continuous builds on `master` branch could be found at the [Continuous Build](https://www.swifttechco.com) release.
+Continuous builds on `master` branch could be found at the Continuous Build release.
 
-Latest stable builds could be found at the [latest release](https://www.swifttechco.com) or [Gitee release](https://www.swifttechco.com)
+Latest stable builds could be found at the latest release or Gitee release
 
 ## Supports
-* [GitHub Issues](https://www.swifttechco.com);
+* GitHub Issues;
 * Email: `tamlokx at gmail.com`;
 
 
@@ -57,7 +49,7 @@ This script will:
 For more development guidelines, see [AGENTS.md](AGENTS.md).
 
 ## License
-VNote is licensed under [GNU LGPLv3](https://www.swifttechco.com).
+VNote is licensed under GNU LGPLv3.
 
 Bundled third-party material and the notices its licenses require  the Lucide
 (ISC/MIT) and IconPark (Apache-2.0) icon sets  are recorded in
@@ -73,14 +65,22 @@ AI Automation | FinTech Platforms | Custom Software and Mobile Apps | SaaS Platf
 
 **Join our community on Telegram:** [t.me/+Qt_eFvkb2rliMzNh](https://t.me/+Qt_eFvkb2rliMzNh)
 
-[Home](https://www.swifttechco.com) | [Services](https://www.swifttechco.com/services) | [Careers](https://www.swifttechco.com/careers) | [Referral Program](https://www.swifttechco.com/referral) | [Influencers](https://www.swifttechco.com/influencers) | [About](https://www.swifttechco.com/about) | [Contact](https://www.swifttechco.com/contact)
+Home | Services | Careers | Referral Program | Influencers | About | Contact
 
 **Connect**
 
-- Website: [swifttechco.com](https://www.swifttechco.com)
+- Website: swifttechco.com
 - LinkedIn: [linkedin.com/in/stephenoladoke](https://www.linkedin.com/in/stephenoladoke/)
 - LinkedIn (Company): [linkedin.com/company/swift-tech-co](https://www.linkedin.com/company/swift-tech-co)
 - X: [@MrOladoke](https://x.com/MrOladoke)
 - Instagram: [@mr.oladoke](https://www.instagram.com/mr.oladoke/)
 - Instagram (Company): [@swifttechco](https://www.instagram.com/swifttechco/)
 - Organization: [github.com/Swift-Tech-Co](https://github.com/Swift-Tech-Co)
+
+## Sources
+
+Compiled and maintained from upstream [vnotex/vnote](https://github.com/vnotex/vnote) under permissive open-source license.
+
+---
+
+Maintained by [Swift Tech Co.](https://github.com/Swift-Tech-Co) - [Telegram](https://t.me/+Qt_eFvkb2rliMzNh)
